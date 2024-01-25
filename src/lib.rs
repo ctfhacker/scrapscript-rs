@@ -112,7 +112,15 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
 
     let mut pos = index;
 
-    'done: while index < input.len() {
+    'done: loop {
+        if index >= input.len() {
+            result.push(Token {
+                id: TokenId::EndOfFile,
+                pos: index as u32,
+            });
+            break 'done;
+        }
+
         macro_rules! continue_while_space {
             () => {
                 // Skip over all whitespace. Reset the current token when hitting whitespace.
@@ -150,7 +158,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
             };
         }
 
-        macro_rules! continue_while_not {
+        macro_rules! continue_until {
             ($until:pat) => {
                 // Skip over all whitespace. Reset the current token when hitting whitespace.
                 while !matches!(input[index], $until) {
@@ -164,6 +172,9 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
                         break 'done;
                     }
                 }
+
+                // Skip over the found pattern
+                index += 1;
             };
         }
 
@@ -196,11 +207,11 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
             [b'-', b'-', ..] => {
                 // Comments are -- COMMENT
                 set_token!(Comment, 2);
-                continue_while_not!(b'\n');
+                continue_until!(b'\n');
             }
             [b'"', ..] => {
                 set_token!(String, 1);
-                continue_while_not!(b'"');
+                continue_until!(b'"');
             }
             [b'.', b'.', b'.', ..] => {
                 set_token!(OpSpread, 3);
@@ -580,6 +591,42 @@ mod tests {
         assert_eq!(
             tokens,
             Ok(vec![Token::new(OpSpread, 0), Token::new(EndOfFile, 3)])
+        );
+    }
+
+    #[test]
+    fn test_ignore_whitespace() {
+        let tokens = tokenize("1\n+\t2");
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new(Int, 0),
+                Token::new(OpAdd, 2),
+                Token::new(Int, 4),
+                Token::new(EndOfFile, 5)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_ignore_line_comment() {
+        let tokens = tokenize("-- 1\n2");
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new(Comment, 0),
+                Token::new(Int, 5),
+                Token::new(EndOfFile, 6)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_string() {
+        let tokens = tokenize("\"hello\"");
+        assert_eq!(
+            tokens,
+            Ok(vec![Token::new(String, 0), Token::new(EndOfFile, 7)])
         );
     }
 }
