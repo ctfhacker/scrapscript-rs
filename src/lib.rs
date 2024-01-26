@@ -11,6 +11,11 @@ pub enum TokenId {
     RightBrace,
     LeftBracket,
     RightBracket,
+    Base85,
+    Base64,
+    Base32,
+    Base16,
+    Comma,
     OpWhere,
     OpAssign,
     OpMatchCase,
@@ -38,6 +43,7 @@ pub enum TokenId {
     OpPipe,
     OpReversePipe,
     OpSpread,
+    OpAssert,
     EndOfFile,
 }
 
@@ -58,6 +64,7 @@ pub enum TokenError {
     FloatWithMultipleDecimalPoints,
     QuoteInVariable,
     DotDot,
+    UnquotedEndOfString,
 }
 
 /*
@@ -211,13 +218,57 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
             }
             [b'"', ..] => {
                 set_token!(String, 1);
-                continue_until!(b'"');
+
+                // Skip over all whitespace. Reset the current token when hitting whitespace.
+                while !matches!(input[index], b'"') {
+                    index += 1;
+
+                    if index >= input.len() {
+                        return Err((TokenError::UnquotedEndOfString, pos));
+                    }
+                }
+
+                // Skip over the found pattern
+                index += 1;
             }
             [b'.', b'.', b'.', ..] => {
                 set_token!(OpSpread, 3);
             }
             [b'.', b'.', ..] => {
                 return Err((TokenError::DotDot, pos));
+            }
+            [b'.', b' ', ..] => {
+                set_token!(OpWhere, 2);
+            }
+            [b'~', b'~', b'8', b'5', b'\'', ..] => {
+                pos += 5;
+                index += 5;
+                set_token!(Base85, 5);
+                continue_while!(b'!'..=b'u');
+            }
+            [b'~', b'~', b'3', b'2', b'\'', ..] => {
+                pos += 5;
+                index += 5;
+                set_token!(Base32, 5);
+                continue_while!(b'A'..=b'Z' | b'2'..=b'7' | b'=');
+            }
+            [b'~', b'~', b'1', b'6', b'\'', ..] => {
+                pos += 5;
+                index += 5;
+                set_token!(Base16, 5);
+                continue_while!(b'A'..=b'F' | b'a'..=b'f' | b'0'..=b'9');
+            }
+            [b'~', b'~', b'6', b'4', b'\'', ..] => {
+                pos += 5;
+                index += 5;
+                set_token!(Base64, 5);
+                continue_while!(b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'=');
+            }
+            [b'~', b'~', ..] => {
+                pos += 2;
+                index += 2;
+                set_token!(Base64, 2);
+                continue_while!(b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'=');
             }
             [b'0'..=b'9' | b'.', ..] => {
                 let mut id = TokenId::Int;
@@ -330,9 +381,6 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
             [b':', ..] => {
                 set_token!(OpHasType, 1);
             }
-            [b'.', ..] => {
-                set_token!(OpWhere, 1);
-            }
             [b'%', ..] => {
                 set_token!(OpMod, 1);
             }
@@ -360,11 +408,20 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
             [b'}', ..] => {
                 set_token!(RightBracket, 1);
             }
+            [b',', ..] => {
+                set_token!(Comma, 1);
+            }
             [b'[', ..] => {
                 set_token!(LeftBrace, 1);
             }
             [b']', ..] => {
                 set_token!(RightBrace, 1);
+            }
+            [b'?', ..] => {
+                set_token!(OpAssert, 1);
+            }
+            [b':', ..] => {
+                set_token!(OpHasType, 1);
             }
             [b'-', ..] => {
                 set_token!(OpSub, 1);
@@ -627,6 +684,171 @@ mod tests {
         assert_eq!(
             tokens,
             Ok(vec![Token::new(String, 0), Token::new(EndOfFile, 7)])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_string_with_spaces() {
+        let tokens = tokenize("\"hello world\"");
+        assert_eq!(
+            tokens,
+            Ok(vec![Token::new(String, 0), Token::new(EndOfFile, 13)])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_string_missing_end_quote() {
+        let tokens = tokenize("\"hello world");
+        assert_eq!(tokens, Err((TokenError::UnquotedEndOfString, 0)));
+    }
+
+    #[test]
+    fn test_tokenisze_empty_list() {
+        let tokens = tokenize("[ ]");
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new(LeftBrace, 0),
+                Token::new(RightBrace, 2),
+                Token::new(EndOfFile, 3)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_list_with_items() {
+        let tokens = tokenize("[ 1 , 2 ]");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new(LeftBrace, 0),
+                Token::new(Int, 2),
+                Token::new(Comma, 4),
+                Token::new(Int, 6),
+                Token::new(RightBrace, 8),
+                Token::new(EndOfFile, 9)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_list_with_items_with_no_spaces() {
+        let tokens = tokenize("[1,2]");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new(LeftBrace, 0),
+                Token::new(Int, 1),
+                Token::new(Comma, 2),
+                Token::new(Int, 3),
+                Token::new(RightBrace, 4),
+                Token::new(EndOfFile, 5)
+            ])
+        );
+    }
+    #[test]
+
+    fn test_tokenize_function() {
+        let tokens = tokenize("a -> b -> a + b");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new(Name, 0),
+                Token::new(OpFunction, 2),
+                Token::new(Name, 5),
+                Token::new(OpFunction, 7),
+                Token::new(Name, 10),
+                Token::new(OpAdd, 12),
+                Token::new(Name, 14),
+                Token::new(EndOfFile, 15)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_function_no_spaces() {
+        let tokens = tokenize("a->b->a+b");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new(Name, 0),
+                Token::new(OpFunction, 1),
+                Token::new(Name, 3),
+                Token::new(OpFunction, 4),
+                Token::new(Name, 6),
+                Token::new(OpAdd, 7),
+                Token::new(Name, 8),
+                Token::new(EndOfFile, 9)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_where() {
+        let tokens = tokenize("a . b");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new(Name, 0),
+                Token::new(OpWhere, 2),
+                Token::new(Name, 4),
+                Token::new(EndOfFile, 5)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_assert() {
+        let tokens = tokenize("a ? b");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new(Name, 0),
+                Token::new(OpAssert, 2),
+                Token::new(Name, 4),
+                Token::new(EndOfFile, 5)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_hastype() {
+        let tokens = tokenize("a : b");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new(Name, 0),
+                Token::new(OpHasType, 2),
+                Token::new(Name, 4),
+                Token::new(EndOfFile, 5)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_bytes_return_bytes_base64() {
+        let tokens = tokenize("~~QUJD");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![Token::new(Base64, 2), Token::new(EndOfFile, 6)])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_base64() {
+        let tokens = tokenize("~~QUJD");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![Token::new(Base64, 2), Token::new(EndOfFile, 6)])
         );
     }
 }
