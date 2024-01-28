@@ -299,13 +299,14 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
                 result.push(Token::new(id, pos as u32));
                 in_token = false;
             }
-            [b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'$' | b'\'' | b'_', ..] => {
+            // Name [a-zA-z$'_][a-zA-Z$'_0-9]*
+            [b'a'..=b'z' | b'A'..=b'Z' | b'$' | b'\'' | b'_', ..] => {
                 // Only allow quotes for names that start with $
                 let allow_quotes = input[index] == b'$';
 
                 set_token!(Name, 1);
 
-                // Skip over all whitespace. Reset the current token when hitting whitespace.
+                // Skip over all characters allowed in a name
                 while matches!(input[index], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'$' | b'_' | b'\'')
                 {
                     // Explicitly disallow quotes in the variable
@@ -849,6 +850,97 @@ mod tests {
         assert_eq!(
             tokens,
             Ok(vec![Token::new(Base64, 2), Token::new(EndOfFile, 6)])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_hole() {
+        let tokens = tokenize("()");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new(LeftParen, 0),
+                Token::new(RightParen, 1),
+                Token::new(EndOfFile, 2)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_hole_with_spaces() {
+        let tokens = tokenize("(  )");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new(LeftParen, 0),
+                Token::new(RightParen, 3),
+                Token::new(EndOfFile, 4)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_token_parenthetical_expression() {
+        let tokens = tokenize("(1+2)");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new(LeftParen, 0),
+                Token::new(Int, 1),
+                Token::new(OpAdd, 2),
+                Token::new(Int, 3),
+                Token::new(RightParen, 4),
+                Token::new(EndOfFile, 5)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_pipe() {
+        let tokens = tokenize("1 |> f . f = a -> a + 1");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new(Int, 0),
+                Token::new(OpPipe, 2),
+                Token::new(Name, 5),
+                Token::new(OpWhere, 7),
+                Token::new(Name, 9),
+                Token::new(OpAssign, 11),
+                Token::new(Name, 13),
+                Token::new(OpFunction, 15),
+                Token::new(Name, 18),
+                Token::new(OpAdd, 20),
+                Token::new(Int, 22),
+                Token::new(EndOfFile, 23)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_reverse_pipe() {
+        let tokens = tokenize("1 <| 1 . f = a -> a + 1");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new(Int, 0),
+                Token::new(OpReversePipe, 2),
+                Token::new(Int, 5),
+                Token::new(OpWhere, 7),
+                Token::new(Name, 9),
+                Token::new(OpAssign, 11),
+                Token::new(Name, 13),
+                Token::new(OpFunction, 15),
+                Token::new(Name, 18),
+                Token::new(OpAdd, 20),
+                Token::new(Int, 22),
+                Token::new(EndOfFile, 23)
+            ])
         );
     }
 }
