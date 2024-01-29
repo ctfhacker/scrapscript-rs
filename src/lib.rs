@@ -44,6 +44,9 @@ pub enum TokenId {
     OpReversePipe,
     OpSpread,
     OpAssert,
+    OpAccess,
+    OpCompose,
+    OpComposeReverse,
     EndOfFile,
 }
 
@@ -117,7 +120,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
     let mut index = 0;
     let mut in_token = false;
 
-    let mut pos = index;
+    let mut pos;
 
     'done: loop {
         if index >= input.len() {
@@ -331,6 +334,12 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
             [b'-', b'>', ..] => {
                 set_token!(OpFunction, 2);
             }
+            [b'>', b'>', ..] => {
+                set_token!(OpCompose, 2);
+            }
+            [b'<', b'<', ..] => {
+                set_token!(OpComposeReverse, 2);
+            }
             [b'=', b'=', ..] => {
                 set_token!(OpEqual, 2);
             }
@@ -382,6 +391,9 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
             [b'!', ..] => {
                 set_token!(OpRightEval, 1);
             }
+            [b'@', ..] => {
+                set_token!(OpAccess, 1);
+            }
             [b':', ..] => {
                 set_token!(OpHasType, 1);
             }
@@ -424,9 +436,6 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
             [b'?', ..] => {
                 set_token!(OpAssert, 1);
             }
-            [b':', ..] => {
-                set_token!(OpHasType, 1);
-            }
             [b'-', ..] => {
                 set_token!(OpSub, 1);
 
@@ -437,7 +446,6 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
             }
             _ => {
                 panic!("Unknown {}", input[index] as char);
-                index += 1;
             }
         }
     }
@@ -963,6 +971,154 @@ mod tests {
                 Token::new(OpAdd, 20),
                 Token::new(Int, 22),
                 Token::new(EndOfFile, 23)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_record_no_fields_no_spaces() {
+        let tokens = tokenize("{}");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new(LeftBracket, 0),
+                Token::new(RightBracket, 1),
+                Token::new(EndOfFile, 2)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_record_no_fields() {
+        let tokens = tokenize("{  }");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new(LeftBracket, 0),
+                Token::new(RightBracket, 3),
+                Token::new(EndOfFile, 4)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_record_one_field() {
+        let tokens = tokenize("{ a = 4 }");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new(LeftBracket, 0),
+                Token::new(Name, 2),
+                Token::new(OpAssign, 4),
+                Token::new(Int, 6),
+                Token::new(RightBracket, 8),
+                Token::new(EndOfFile, 9)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_record_multiple_fields() {
+        let tokens = tokenize(r#"{ a = 4, b = "z" }"#);
+
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new(LeftBracket, 0),
+                Token::new(Name, 2),
+                Token::new(OpAssign, 4),
+                Token::new(Int, 6),
+                Token::new(Comma, 7),
+                Token::new(Name, 9),
+                Token::new(OpAssign, 11),
+                Token::new(String, 13),
+                Token::new(RightBracket, 17),
+                Token::new(EndOfFile, 18)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_record_access() {
+        let tokens = tokenize("r@a");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new(Name, 0),
+                Token::new(OpAccess, 1),
+                Token::new(Name, 2),
+                Token::new(EndOfFile, 3)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_right_eval() {
+        let tokens = tokenize("a!b");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new(Name, 0),
+                Token::new(OpRightEval, 1),
+                Token::new(Name, 2),
+                Token::new(EndOfFile, 3)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_match() {
+        let tokens = tokenize("g = | 1 -> 2 | 2 -> 3");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new(Name, 0),
+                Token::new(OpAssign, 2),
+                Token::new(OpMatchCase, 4),
+                Token::new(Int, 6),
+                Token::new(OpFunction, 8),
+                Token::new(Int, 11),
+                Token::new(OpMatchCase, 13),
+                Token::new(Int, 15),
+                Token::new(OpFunction, 17),
+                Token::new(Int, 20),
+                Token::new(EndOfFile, 21)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_compose() {
+        let tokens = tokenize("f >> g");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new(Name, 0),
+                Token::new(OpCompose, 2),
+                Token::new(Name, 5),
+                Token::new(EndOfFile, 6)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_compose_reverse() {
+        let tokens = tokenize("f << g");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new(Name, 0),
+                Token::new(OpComposeReverse, 2),
+                Token::new(Name, 5),
+                Token::new(EndOfFile, 6)
             ])
         );
     }
