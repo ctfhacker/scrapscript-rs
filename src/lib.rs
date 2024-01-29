@@ -245,12 +245,14 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
                 index += 5;
                 set_token!(Base85, 5);
                 continue_while!(b'!'..=b'u');
+                println!("Base85: After: {pos} {index}");
             }
             [b'~', b'~', b'3', b'2', b'\'', ..] => {
                 pos += 5;
                 index += 5;
                 set_token!(Base32, 5);
                 continue_while!(b'A'..=b'Z' | b'2'..=b'7' | b'=');
+                println!("Base32: After: {pos} {index}");
             }
             [b'~', b'~', b'1', b'6', b'\'', ..] => {
                 pos += 5;
@@ -263,6 +265,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
                 index += 5;
                 set_token!(Base64, 5);
                 continue_while!(b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'=');
+                println!("Base64: After: {pos} {index}");
             }
             [b'~', b'~', ..] => {
                 pos += 2;
@@ -844,12 +847,32 @@ mod tests {
     }
 
     #[test]
-    fn test_tokenize_base64() {
-        let tokens = tokenize("~~QUJD");
+    fn test_tokenize_base85() {
+        let tokens = tokenize("~~85'K|(_)");
 
         assert_eq!(
             tokens,
-            Ok(vec![Token::new(Base64, 2), Token::new(EndOfFile, 6)])
+            Ok(vec![Token::new(Base85, 5), Token::new(EndOfFile, 10)])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_base64() {
+        let tokens = tokenize("~~64'K|(_)");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![Token::new(Base64, 5), Token::new(EndOfFile, 10)])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_base32() {
+        let tokens = tokenize("~~32'K|(_)");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![Token::new(Base32, 5), Token::new(EndOfFile, 10)])
         );
     }
 
