@@ -16,6 +16,7 @@ pub enum TokenId {
     Base32,
     Base16,
     Comma,
+    Symbol,
     OpWhere,
     OpAssign,
     OpMatchCase,
@@ -68,6 +69,8 @@ pub enum TokenError {
     QuoteInVariable,
     DotDot,
     UnquotedEndOfString,
+    UnexpectedEndOfFile,
+    InvalidSymbol,
 }
 
 /*
@@ -305,6 +308,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
                 result.push(Token::new(id, pos as u32));
                 in_token = false;
             }
+
             // Name [a-zA-z$'_][a-zA-Z$'_0-9]*
             [b'a'..=b'z' | b'A'..=b'Z' | b'$' | b'\'' | b'_', ..] => {
                 // Only allow quotes for names that start with $
@@ -375,6 +379,38 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
             }
             [b'<', b'|', ..] => {
                 set_token!(OpReversePipe, 2);
+            }
+            [b'#', ..] => {
+                index += 1;
+
+                let mut is_empty = true;
+                continue_while_space!();
+
+                pos = index;
+                set_token!(Symbol, 0);
+
+                // Skip over all characters allowed in a name
+                while matches!(input[index], b'a'..=b'z' | b'A'..=b'Z' | b'$' | b'_' | b'\'') {
+                    index += 1;
+                    is_empty = false;
+
+                    if index >= input.len() {
+                        result.push(Token {
+                            id: TokenId::EndOfFile,
+                            pos: index as u32,
+                        });
+
+                        break 'done;
+                    }
+                }
+
+                if is_empty {
+                    if index >= input.len() {
+                        return Err((TokenError::UnexpectedEndOfFile, pos));
+                    } else {
+                        return Err((TokenError::InvalidSymbol, pos));
+                    }
+                }
             }
             [b'*', ..] => {
                 set_token!(OpMul, 1);
@@ -1121,5 +1157,152 @@ mod tests {
                 Token::new(EndOfFile, 6)
             ])
         );
+    }
+
+    #[test]
+    fn test_tokenize_list_with_only_spread() {
+        let tokens = tokenize("[ ... ]");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new(LeftBrace, 0),
+                Token::new(OpSpread, 2),
+                Token::new(RightBrace, 6),
+                Token::new(EndOfFile, 7)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_list_with_spread() {
+        let tokens = tokenize("[ 1 , ... ]");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new(LeftBrace, 0),
+                Token::new(Int, 2),
+                Token::new(Comma, 4),
+                Token::new(OpSpread, 6),
+                Token::new(RightBrace, 10),
+                Token::new(EndOfFile, 11)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_list_with_spread_no_spaces() {
+        let tokens = tokenize("[1,...]");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new(LeftBrace, 0),
+                Token::new(Int, 1),
+                Token::new(Comma, 2),
+                Token::new(OpSpread, 3),
+                Token::new(RightBrace, 6),
+                Token::new(EndOfFile, 7)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_list_with_named_spread() {
+        let tokens = tokenize("[1,...rest]");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new(LeftBrace, 0),
+                Token::new(Int, 1),
+                Token::new(Comma, 2),
+                Token::new(OpSpread, 3),
+                Token::new(Name, 6),
+                Token::new(RightBrace, 10),
+                Token::new(EndOfFile, 11)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_record_with_only_spread() {
+        let tokens = tokenize("{ ... }");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new(LeftBracket, 0),
+                Token::new(OpSpread, 2),
+                Token::new(RightBracket, 6),
+                Token::new(EndOfFile, 7)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_record_with_spread() {
+        let tokens = tokenize("{ x = 1, ... }");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new(LeftBracket, 0),
+                Token::new(Name, 2),
+                Token::new(OpAssign, 4),
+                Token::new(Int, 6),
+                Token::new(Comma, 7),
+                Token::new(OpSpread, 9),
+                Token::new(RightBracket, 13),
+                Token::new(EndOfFile, 14)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_record_with_spread_no_spaces() {
+        let tokens = tokenize("{x=1,...}");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![
+                Token::new(LeftBracket, 0),
+                Token::new(Name, 1),
+                Token::new(OpAssign, 2),
+                Token::new(Int, 3),
+                Token::new(Comma, 4),
+                Token::new(OpSpread, 5),
+                Token::new(RightBracket, 8),
+                Token::new(EndOfFile, 9)
+            ])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_symbol_with_space() {
+        let tokens = tokenize("#   abc");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![Token::new(Symbol, 4), Token::new(EndOfFile, 7)])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_symbol_with_no_space() {
+        let tokens = tokenize("#abc");
+
+        assert_eq!(
+            tokens,
+            Ok(vec![Token::new(Symbol, 1), Token::new(EndOfFile, 4)])
+        );
+    }
+
+    #[test]
+    fn test_tokenize_symbol_non_name_raises_parse_error() {
+        let tokens = tokenize("#111");
+
+        assert_eq!(tokens, Err((TokenError::InvalidSymbol, 1)));
     }
 }
