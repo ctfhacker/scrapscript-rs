@@ -1,3 +1,6 @@
+use core::ops::{Index, IndexMut};
+use std::collections::HashSet;
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TokenId {
     Name,
@@ -17,38 +20,185 @@ pub enum TokenId {
     Base16,
     Comma,
     Symbol,
+
+    /// Operator .
     OpWhere,
+
+    /// Operator =
     OpAssign,
+
+    /// Operator |
     OpMatchCase,
+
+    /// Operator ->
     OpFunction,
-    OpMul,
-    OpDiv,
-    OpExp,
+
+    /// Operator +
     OpAdd,
+
+    /// Operator -
     OpSub,
+
+    /// Operator ==
     OpEqual,
+
+    /// Operator %
     OpMod,
+
+    /// Operator //
     OpFloorDiv,
-    OpNotEqua,
+
+    /// Operator /=
+    OpNotEqual,
+
+    /// Operator <
     OpLess,
+
+    /// Operator >
     OpGreater,
+
+    /// Operator <=
     OpLessEqual,
+
+    /// Operator >=
     OpGreaterEqual,
+
+    /// Operator &&
     OpBoolAnd,
+
+    /// Operator ||
     OpBoolOr,
+
+    /// Operator ++
     OpStrConcat,
+
+    /// Operator >+ (List concat)
     OpListCons,
+
+    /// Operator >+ (List append)
     OpListAppend,
+
+    /// Operator !
     OpRightEval,
+
+    /// Operator :
     OpHasType,
+
+    /// Operator |>
     OpPipe,
+
+    /// Operator <|
     OpReversePipe,
+
+    /// Operator ...
     OpSpread,
+
+    /// Operator ?
     OpAssert,
-    OpAccess,
+
+    /// Operator *
+    OpMul,
+
+    /// Operator /
+    OpDiv,
+
+    /// Operator ^
+    OpExp,
+
+    /// Operator >>
     OpCompose,
+
+    /// Operator <<
     OpComposeReverse,
+
+    /// Operator @
+    OpAccess,
+
+    OpNegate,
+
+    /// EOF
     EndOfFile,
+}
+
+impl TokenId {
+    pub fn get_op_prescedence(&self) -> Option<u32> {
+        use TokenId::*;
+
+        match self {
+            OpAccess => Some(1001),
+            OpComposeReverse | OpCompose => Some(140),
+            OpExp => Some(130),
+            OpMul | OpDiv | OpFloorDiv | OpMod => Some(120),
+            OpSub | OpAdd => Some(110),
+            OpListCons | OpListAppend => Some(100),
+            OpEqual | OpNotEqual | OpLess | OpGreater | OpLessEqual | OpGreaterEqual => Some(90),
+            OpBoolAnd => Some(80),
+            OpBoolOr => Some(70),
+            OpPipe | OpReversePipe => Some(60),
+            OpFunction => Some(50),
+            OpMatchCase => Some(42),
+            OpHasType => Some(41),
+            OpAssign => Some(40),
+            OpRightEval | OpWhere | OpAssert => Some(30),
+            Comma => Some(10),
+            OpSpread => Some(0),
+            x => {
+                println!("Unknown operator prescedence: {x:?}");
+                return None;
+            }
+        }
+    }
+}
+
+/// Abstract syntax tree nodes
+#[derive(Debug, Clone, PartialEq)]
+pub enum Node {
+    /// An integer value (leaf)
+    Int { data: i64 },
+
+    /// A float value (leaf)
+    Float { data: f64 },
+
+    /// A variable
+    Var { data: String },
+
+    /// A vec of bytes
+    Bytes { data: Vec<u8> },
+
+    /// A subtraction operation between two nodes
+    Sub { left: NodeId, right: NodeId },
+
+    /// An addition operation between two nodes
+    Add { left: NodeId, right: NodeId },
+
+    /// A multiplication operation between two nodes
+    Mul { left: NodeId, right: NodeId },
+
+    /// A greater than operation between two nodes
+    GreaterThan { left: NodeId, right: NodeId },
+
+    /// An access operation between two nodes
+    Access { left: NodeId, right: NodeId },
+
+    /// An apply operation between two nodes
+    Apply { left: NodeId, right: NodeId },
+}
+
+impl Node {
+    pub fn label(&self) -> String {
+        match self {
+            Node::Int { data } => format!("{data:#x} ({data})"),
+            Node::Float { data } => format!("{data:.4}"),
+            Node::Var { data } => format!("{data}"),
+            Node::Bytes { data } => format!("{data:02x?}"),
+            Node::Sub { .. } => format!("-"),
+            Node::Add { .. } => format!("+"),
+            Node::Mul { .. } => format!("*"),
+            Node::GreaterThan { .. } => format!(">"),
+            Node::Access { .. } => format!("@"),
+            Node::Apply { .. } => format!("APPLY"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -73,46 +223,124 @@ pub enum TokenError {
     InvalidSymbol,
 }
 
-/*
-PS = {
-    "::": lp(2000),
-    "@": rp(1001),
-    "": rp(1000),
-    ">>": lp(14),
-    "<<": lp(14),
-    "^": rp(13),
-    "*": lp(12),
-    "/": lp(12),
-    "//": lp(12),
-    "%": lp(12),
-    "+": lp(11),
-    "-": lp(11),
-    ">*": rp(10),
-    "++": rp(10),
-    ">+": lp(10),
-    "+<": rp(10),
-    "==": np(9),
-    "/=": np(9),
-    "<": np(9),
-    ">": np(9),
-    "<=": np(9),
-    ">=": np(9),
-    "&&": rp(8),
-    "||": rp(7),
-    "|>": rp(6),
-    "<|": lp(6),
-    "->": lp(5),
-    "|": rp(4.5),
-    ":": lp(4.5),
-    "=": rp(4),
-    "!": lp(3),
-    ".": rp(3),
-    "?": rp(3),
-    ",": xp(1),
-    # TODO: Fix precedence for spread
-    "...": xp(0),
+#[derive(Debug, PartialEq)]
+pub enum ParseError {
+    NoTokensGiven,
+    Int(std::num::ParseIntError),
+    Float(std::num::ParseFloatError),
 }
-*/
+
+/// A basic syntax tree of nodes
+#[derive(Default, Debug, PartialEq)]
+pub struct SyntaxTree {
+    nodes: Vec<Node>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NodeId(usize);
+
+impl std::fmt::Display for NodeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl Index<NodeId> for Vec<Node> {
+    type Output = Node;
+
+    fn index(&self, index: NodeId) -> &Self::Output {
+        &self[index.0]
+    }
+}
+
+impl IndexMut<NodeId> for Vec<Node> {
+    fn index_mut(&mut self, index: NodeId) -> &mut Self::Output {
+        &mut self[index.0]
+    }
+}
+
+/// Implement a node that has a single `data` child
+macro_rules! impl_data_node {
+    ($func_name:ident, $node:ident, $ty:ty) => {
+        pub fn $func_name(&mut self, data: $ty) -> NodeId {
+            let node_index = self.nodes.len();
+
+            let node = Node::$node { data };
+            self.nodes.push(node);
+
+            NodeId(node_index)
+        }
+    };
+}
+
+/// Implement a node that has `left` and `right` children
+macro_rules! impl_left_right_node {
+    ($func_name:ident, $node:ident) => {
+        pub fn $func_name(&mut self, left: NodeId, right: NodeId) -> NodeId {
+            let node_index = self.nodes.len();
+
+            let node = Node::$node { left, right };
+            self.nodes.push(node);
+
+            NodeId(node_index)
+        }
+    };
+}
+
+impl SyntaxTree {
+    impl_data_node!(int, Int, i64);
+    impl_data_node!(float, Float, f64);
+    impl_data_node!(name, Var, String);
+    impl_left_right_node!(sub, Sub);
+    impl_left_right_node!(add, Add);
+    impl_left_right_node!(mul, Mul);
+    impl_left_right_node!(greater_than, GreaterThan);
+    impl_left_right_node!(access, Access);
+    impl_left_right_node!(apply, Apply);
+
+    /// Dump a .dot of this syntax tree
+    pub fn dump_dot(&self, root: NodeId, out_name: &str) {
+        let mut queue = vec![root];
+        let mut seen_nodes = HashSet::new();
+
+        let mut dot = String::from("digraph {\n");
+
+        while let Some(node_id) = queue.pop() {
+            // Ignore nodes we've already seen
+            if !seen_nodes.insert(node_id) {
+                continue;
+            }
+
+            let curr_node = &self.nodes[node_id];
+
+            dot.push_str(&format!("{node_id} [ label = {:?} ];\n", curr_node.label()));
+
+            match curr_node {
+                Node::Sub { left, right }
+                | Node::Add { left, right }
+                | Node::Mul { left, right }
+                | Node::GreaterThan { left, right }
+                | Node::Apply { left, right }
+                | Node::Access { left, right } => {
+                    queue.push(*left);
+                    queue.push(*right);
+
+                    dot.push_str(&format!("{node_id} -> {left}  [ label=\"left\"; ];\n"));
+                    dot.push_str(&format!("{node_id} -> {right} [ label=\"right\"; ];\n"));
+                }
+                Node::Int { .. } | Node::Float { .. } | Node::Var { .. } | Node::Bytes { .. } => {
+                    // This is a leaf node.. nothing else to parse
+                }
+            }
+        }
+
+        dot.push('}');
+
+        println!("{dot}");
+
+        std::fs::write(out_name, dot).expect("Failed to write dot file");
+    }
+}
 
 /// Convert the input program into a list of tokens
 pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
@@ -351,7 +579,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
                 set_token!(OpFloorDiv, 2);
             }
             [b'/', b'=', ..] => {
-                set_token!(OpNotEqua, 2);
+                set_token!(OpNotEqual, 2);
             }
             [b'<', b'=', ..] => {
                 set_token!(OpLessEqual, 2);
@@ -489,6 +717,177 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
     Ok(result)
 }
 
+pub fn parse(
+    tokens: &[Token],
+    token_index: &mut usize,
+    input: &str,
+    ast: &mut SyntaxTree,
+    current_precedence: u32,
+) -> Result<NodeId, (ParseError, usize)> {
+    if tokens.is_empty() {
+        return Err((ParseError::NoTokensGiven, 0));
+    }
+
+    let input_bytes = input.as_bytes();
+
+    let parse_leaf = |ast: &mut SyntaxTree,
+                      token_index: &mut usize|
+     -> Result<NodeId, (ParseError, usize)> {
+        let start_token_pos = *token_index;
+
+        let start = tokens[start_token_pos];
+        *token_index += 1;
+
+        let input_index = start.pos as usize;
+        let mut end_input_index = tokens[*token_index].pos as usize - 1;
+
+        dbg!(start.id);
+
+        macro_rules! continue_while {
+            ($pat:pat) => {
+                // Skip over all whitespace. Reset the current token when hitting whitespace.
+                while end_input_index > input_index && !matches!(input_bytes[end_input_index], $pat)
+                {
+                    end_input_index -= 1;
+                }
+            };
+        }
+
+        // Parse the next leaf token
+        let leaf = match start.id {
+            TokenId::Int => {
+                continue_while!(b'0'..=b'9');
+
+                let value = input[input_index..=end_input_index]
+                    .parse()
+                    .map_err(|e| (ParseError::Int(e), input_index))?;
+
+                // Add an Int node
+                ast.int(value)
+            }
+            TokenId::Float => {
+                continue_while!(b'0'..=b'9' | b'.');
+
+                let value = input[input_index..=end_input_index]
+                    .parse()
+                    .map_err(|e| (ParseError::Float(e), input_index))?;
+
+                // Add an Int node
+                ast.float(value)
+            }
+            TokenId::OpSub => {
+                let zero_int = ast.int(0);
+
+                let right = parse(tokens, token_index, input, ast, 5000)?;
+
+                ast.sub(zero_int, right)
+            }
+            TokenId::Name => {
+                continue_while!(b'a'..=b'z' | b'A'..=b'Z' | b'$' | b'\'' | b'_' | b'0'..=b'9');
+                let name = input[input_index..=end_input_index].to_string();
+                ast.name(name)
+            }
+            TokenId::OpAdd => {
+                panic!("Hit Add as a left operation!?")
+            }
+
+            TokenId::Base64 => {
+                todo!();
+
+                continue_while!(b'a'..=b'z' | b'A'..=b'Z' | b'$' | b'\'' | b'_' | b'0'..=b'9');
+                let name = input[input_index..=end_input_index].to_string();
+                ast.name(name)
+            }
+            x => panic!("Unknown parse token: {x:?}"),
+        };
+
+        Ok(leaf)
+    };
+
+    let mut left = parse_leaf(ast, token_index)?;
+    println!("Left: {:?}", ast.nodes[left]);
+
+    //
+    loop {
+        println!("{input}");
+        println!("{}^", " ".repeat(*token_index));
+
+        // Check if the left was modified
+        let original = left;
+
+        let Some(next) = tokens.get(*token_index) else {
+            println!("Breaking out of the loop..");
+            break;
+        };
+
+        if matches!(next.id, TokenId::EndOfFile) {
+            break;
+        }
+
+        if let Some(binary_prescedence) = next.id.get_op_prescedence() {
+            let binary_op = next;
+            // Is a binary operator
+
+            // If the next prescedence is less than the current, return out of the loop
+            if binary_prescedence <= current_precedence {
+                println!("Found smaller.. bailing");
+                return Ok(left);
+            }
+
+            // Increment the token index
+            *token_index += 1;
+
+            let right = parse(tokens, token_index, input, ast, binary_prescedence)?;
+            match binary_op.id {
+                TokenId::EndOfFile => {
+                    println!("Hit EOF");
+                    break;
+                }
+
+                TokenId::OpAdd => {
+                    left = ast.add(left, right);
+                }
+
+                TokenId::OpSub => {
+                    left = ast.sub(left, right);
+                }
+
+                TokenId::OpMul => {
+                    left = ast.mul(left, right);
+                }
+
+                TokenId::OpGreater => {
+                    left = ast.greater_than(left, right);
+                }
+
+                TokenId::OpAccess => {
+                    left = ast.access(left, right);
+                }
+
+                x => panic!("Unknown operator token: {x:?}"),
+            }
+        } else {
+            println!("Not a bin op: {next:?}");
+
+            if TokenId::OpAccess.get_op_prescedence().unwrap() < current_precedence {
+                break;
+            }
+
+            let right = parse(tokens, token_index, input, ast, current_precedence + 1)?;
+
+            left = ast.apply(left, right);
+        }
+
+        // Base case: The tree didn't move, we've reached the end
+        if left == original {
+            break;
+        }
+    }
+
+    println!("Out of loop..");
+    Ok(left)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -610,7 +1009,7 @@ mod tests {
             ("%", OpMod),
             ("==", OpEqual),
             ("//", OpFloorDiv),
-            ("/=", OpNotEqua),
+            ("/=", OpNotEqual),
             ("<", OpLess),
             (">", OpGreater),
             ("<=", OpLessEqual),
@@ -1304,5 +1703,395 @@ mod tests {
         let tokens = tokenize("#111");
 
         assert_eq!(tokens, Err((TokenError::InvalidSymbol, 1)));
+    }
+
+    #[test]
+    fn test_parse_empty_tokens() {
+        let mut ast = SyntaxTree::default();
+        let mut token_position = 0;
+        let tokens = parse(&[], &mut token_position, "", &mut ast, u32::MIN);
+        assert_eq!(tokens, Err((ParseError::NoTokensGiven, 0)));
+    }
+
+    #[test]
+    fn test_parse_digit_returns_int() {
+        let mut ast = SyntaxTree::default();
+        let mut token_position = 0;
+        let input = "1";
+        let tokens = tokenize(input).unwrap();
+        parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![Node::Int { data: 1 }]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_digits_returns_int() {
+        let mut ast = SyntaxTree::default();
+        let mut token_position = 0;
+
+        let input = "123";
+        let tokens = tokenize(input).unwrap();
+        parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![Node::Int { data: 123 }]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_negative_int_returns_binary_sub_int() {
+        let mut ast = SyntaxTree::default();
+        let mut token_position = 0;
+        let input = "-123";
+        let tokens = tokenize(input).unwrap();
+        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Int { data: 0 },
+                    Node::Int { data: 123 },
+                    Node::Sub {
+                        left: NodeId(0),
+                        right: NodeId(1)
+                    }
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_negative_var() {
+        let mut ast = SyntaxTree::default();
+        let mut token_position = 0;
+        let input = "-x";
+        let tokens = tokenize(input).unwrap();
+        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Int { data: 0 },
+                    Node::Var {
+                        data: "x".to_string()
+                    },
+                    Node::Sub {
+                        left: NodeId(0),
+                        right: NodeId(1)
+                    }
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_negative_int_binds_tighter_than_plus() {
+        let input = "-l+r";
+        let mut token_position = 0;
+        let mut ast = SyntaxTree::default();
+        let tokens = tokenize(input).unwrap();
+        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Int { data: 0 },
+                    Node::Var {
+                        data: "l".to_string()
+                    },
+                    Node::Sub {
+                        left: NodeId(0),
+                        right: NodeId(1)
+                    },
+                    Node::Var {
+                        data: "r".to_string()
+                    },
+                    Node::Add {
+                        left: NodeId(2),
+                        right: NodeId(3)
+                    },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_negative_int_binds_tighter_than_mul() {
+        let input = "-l*r";
+        let mut token_position = 0;
+        let mut ast = SyntaxTree::default();
+        let tokens = tokenize(input).unwrap();
+        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Int { data: 0 },
+                    Node::Var {
+                        data: "l".to_string()
+                    },
+                    Node::Sub {
+                        left: NodeId(0),
+                        right: NodeId(1)
+                    },
+                    Node::Var {
+                        data: "r".to_string()
+                    },
+                    Node::Mul {
+                        left: NodeId(2),
+                        right: NodeId(3)
+                    },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_negative_int_binds_tighter_than_access() {
+        let input = "-l@r";
+        let mut token_position = 0;
+        let mut ast = SyntaxTree::default();
+        let tokens = tokenize(input).unwrap();
+        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Int { data: 0 },
+                    Node::Var {
+                        data: "l".to_string()
+                    },
+                    Node::Sub {
+                        left: NodeId(0),
+                        right: NodeId(1)
+                    },
+                    Node::Var {
+                        data: "r".to_string()
+                    },
+                    Node::Access {
+                        left: NodeId(2),
+                        right: NodeId(3)
+                    },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_negative_int_binds_tighter_than_apply() {
+        let input = "-l r";
+        let mut token_position = 0;
+        let mut ast = SyntaxTree::default();
+        let tokens = tokenize(input).unwrap();
+
+        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Int { data: 0 },
+                    Node::Var {
+                        data: "l".to_string()
+                    },
+                    Node::Sub {
+                        left: NodeId(0),
+                        right: NodeId(1)
+                    },
+                    Node::Var {
+                        data: "r".to_string()
+                    },
+                    Node::Apply {
+                        left: NodeId(2),
+                        right: NodeId(3)
+                    },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_decimal_return_float() {
+        let input = "3.14";
+        let mut token_position = 0;
+        let mut ast = SyntaxTree::default();
+        let tokens = tokenize(input).unwrap();
+
+        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![Node::Float { data: 3.14 },]
+            }
+        );
+    }
+    #[test]
+    fn test_parse_decimal_return_returns_binary_sub_float() {
+        let input = "-3.14";
+        let mut token_position = 0;
+        let mut ast = SyntaxTree::default();
+        let tokens = tokenize(input).unwrap();
+
+        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Int { data: 0 },
+                    Node::Float { data: 3.14 },
+                    Node::Sub {
+                        left: NodeId(0),
+                        right: NodeId(1)
+                    }
+                ]
+            }
+        );
+    }
+    #[test]
+    fn test_parse_var_returns_var() {
+        let input = "abc_123";
+        let mut token_position = 0;
+        let mut ast = SyntaxTree::default();
+        let tokens = tokenize(input).unwrap();
+
+        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![Node::Var {
+                    data: "abc_123".to_string()
+                },]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_sha_var_returns_var() {
+        let input = "$sha1'abc";
+        let mut token_position = 0;
+        let mut ast = SyntaxTree::default();
+        let tokens = tokenize(input).unwrap();
+
+        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![Node::Var {
+                    data: "$sha1'abc".to_string()
+                },]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_sha_var_quote_returns_var() {
+        let input = "$sha1'abc";
+        let mut token_position = 0;
+        let mut ast = SyntaxTree::default();
+        let tokens = tokenize(input).unwrap();
+
+        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![Node::Var {
+                    data: "$sha1'abc".to_string()
+                },]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_dollar_dollar_returns_var() {
+        let input = "$$";
+        let mut token_position = 0;
+        let mut ast = SyntaxTree::default();
+        let tokens = tokenize(input).unwrap();
+
+        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![Node::Var {
+                    data: "$$".to_string()
+                },]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_dollar_returns_var() {
+        let input = "$";
+        let mut token_position = 0;
+        let mut ast = SyntaxTree::default();
+        let tokens = tokenize(input).unwrap();
+
+        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        ast.dump_dot(_root, "/tmp/dump");
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![Node::Var {
+                    data: "$".to_string()
+                },]
+            }
+        );
+    }
+    #[test]
+    fn test_parse_dollar_dollar_return_var() {
+        let input = "$$bills";
+        let mut token_position = 0;
+        let mut ast = SyntaxTree::default();
+        let tokens = tokenize(input).unwrap();
+
+        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        ast.dump_dot(_root, "/tmp/dump");
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![Node::Var {
+                    data: "$$bills".to_string()
+                },]
+            }
+        );
+    }
+    #[test]
+    fn test_parse_bytes_returns_bytes() {
+        let input = "~~64'QUJD";
+        let mut token_position = 0;
+        let mut ast = SyntaxTree::default();
+        let tokens = tokenize(input).unwrap();
+
+        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        ast.dump_dot(_root, "/tmp/dump");
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![Node::Bytes {
+                    data: "ABC".as_bytes().to_vec()
+                },]
+            }
+        );
     }
 }
