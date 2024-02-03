@@ -165,6 +165,9 @@ pub enum Node {
     /// A vec of bytes
     Bytes { data: Vec<u8> },
 
+    /// A exponentiation operation
+    Exp { left: NodeId, right: NodeId },
+
     /// A subtraction operation between two nodes
     Sub { left: NodeId, right: NodeId },
 
@@ -190,10 +193,13 @@ impl Node {
             Node::Int { data } => format!("{data:#x} ({data})"),
             Node::Float { data } => format!("{data:.4}"),
             Node::Var { data } => format!("{data}"),
-            Node::Bytes { data } => format!("{data:02x?}"),
+            Node::Bytes { data } => {
+                format!("{:?}", data.iter().map(|x| *x as char).collect::<Vec<_>>())
+            }
             Node::Sub { .. } => format!("-"),
             Node::Add { .. } => format!("+"),
             Node::Mul { .. } => format!("*"),
+            Node::Exp { .. } => format!("^"),
             Node::GreaterThan { .. } => format!(">"),
             Node::Access { .. } => format!("@"),
             Node::Apply { .. } => format!("APPLY"),
@@ -223,11 +229,13 @@ pub enum TokenError {
     InvalidSymbol,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub enum ParseError {
     NoTokensGiven,
     Int(std::num::ParseIntError),
     Float(std::num::ParseFloatError),
+    Base85(base85::Error),
+    Base64(base64::DecodeError),
 }
 
 /// A basic syntax tree of nodes
@@ -291,12 +299,14 @@ impl SyntaxTree {
     impl_data_node!(int, Int, i64);
     impl_data_node!(float, Float, f64);
     impl_data_node!(name, Var, String);
+    impl_data_node!(bytes, Bytes, Vec<u8>);
     impl_left_right_node!(sub, Sub);
     impl_left_right_node!(add, Add);
     impl_left_right_node!(mul, Mul);
     impl_left_right_node!(greater_than, GreaterThan);
     impl_left_right_node!(access, Access);
     impl_left_right_node!(apply, Apply);
+    impl_left_right_node!(exp, Exp);
 
     /// Dump a .dot of this syntax tree
     pub fn dump_dot(&self, root: NodeId, out_name: &str) {
@@ -320,6 +330,7 @@ impl SyntaxTree {
                 | Node::Add { left, right }
                 | Node::Mul { left, right }
                 | Node::GreaterThan { left, right }
+                | Node::Exp { left, right }
                 | Node::Apply { left, right }
                 | Node::Access { left, right } => {
                     queue.push(*left);
@@ -328,6 +339,8 @@ impl SyntaxTree {
                     dot.push_str(&format!("{node_id} -> {left}  [ label=\"left\"; ];\n"));
                     dot.push_str(&format!("{node_id} -> {right} [ label=\"right\"; ];\n"));
                 }
+
+
                 Node::Int { .. } | Node::Float { .. } | Node::Var { .. } | Node::Bytes { .. } => {
                     // This is a leaf node.. nothing else to parse
                 }
@@ -371,7 +384,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
                     if index >= input.len() {
                         result.push(Token {
                             id: TokenId::EndOfFile,
-                            pos: index as u32,
+                            pos: input.len() as u32,
                         });
                         break 'done;
                     }
@@ -391,7 +404,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
                     if index >= input.len() {
                         result.push(Token {
                             id: TokenId::EndOfFile,
-                            pos: index as u32,
+                            pos: input.len() as u32,
                         });
                         break 'done;
                     }
@@ -408,7 +421,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
                     if index >= input.len() {
                         result.push(Token {
                             id: TokenId::EndOfFile,
-                            pos: index as u32,
+                            pos: input.len() as u32,
                         });
                         break 'done;
                     }
@@ -427,12 +440,13 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
                         pos: pos as u32,
                     });
                 }
+
                 in_token = false;
                 index += $num_chars;
                 if index >= input.len() {
                     result.push(Token {
                         id: TokenId::EndOfFile,
-                        pos: index as u32,
+                        pos: input.len() as u32,
                     });
                     break 'done;
                 }
@@ -478,7 +492,12 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
                 pos += 5;
                 index += 5;
                 set_token!(Base85, 5);
-                continue_while!(b'!'..=b'u');
+
+                continue_while!(b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | 
+                    b'!' | b'#' | b'$' | b'%' | b'&' | b'(' | b')' | b'*' | 
+                    b'+' | b'-' | b';' | b'<' | b'=' | b'>' | b'?' | b'@' | 
+                    b'^' | b'_' | b'`' | b'{' | b'|' | b'}' | b'~' | b'"');
+
                 println!("Base85: After: {pos} {index}");
             }
             [b'~', b'~', b'3', b'2', b'\'', ..] => {
@@ -791,12 +810,30 @@ pub fn parse(
                 panic!("Hit Add as a left operation!?")
             }
 
-            TokenId::Base64 => {
-                todo!();
+            TokenId::Base85 => {
+                continue_while!(b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | 
+                    b'!' | b'#' | b'$' | b'%' | b'&' | b'(' | b')' | b'*' | 
+                    b'+' | b'-' | b';' | b'<' | b'=' | b'>' | b'?' | b'@' | 
+                    b'^' | b'_' | b'`' | b'{' | b'|' | b'}' | b'~' | b'"');
+                let name = &input[input_index..=end_input_index];
 
-                continue_while!(b'a'..=b'z' | b'A'..=b'Z' | b'$' | b'\'' | b'_' | b'0'..=b'9');
-                let name = input[input_index..=end_input_index].to_string();
-                ast.name(name)
+                let bytes = base85::decode(name)
+                    .map_err(|e| (ParseError::Base85(e), start.pos as usize))?;
+                ast.bytes(bytes)
+            }
+            TokenId::Base64 => {
+                use base64::Engine;
+
+                let name = &input[input_index..=end_input_index];
+                continue_while!(b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'=');
+
+                // Decode the base64 string
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(name)
+                    .map_err(|e| (ParseError::Base64(e), start.pos as usize))?;
+
+                // Create the decoded bytes string
+                ast.bytes(bytes)
             }
             x => panic!("Unknown parse token: {x:?}"),
         };
@@ -854,6 +891,10 @@ pub fn parse(
 
                 TokenId::OpMul => {
                     left = ast.mul(left, right);
+                }
+
+                TokenId::OpExp => {
+                    left = ast.exp(left, right);
                 }
 
                 TokenId::OpGreater => {
@@ -1291,31 +1332,31 @@ mod tests {
 
     #[test]
     fn test_tokenize_base85() {
-        let tokens = tokenize("~~85'K|(_)");
+        let tokens = tokenize("~~85'K|(_");
 
         assert_eq!(
             tokens,
-            Ok(vec![Token::new(Base85, 5), Token::new(EndOfFile, 10)])
+            Ok(vec![Token::new(Base85, 5), Token::new(EndOfFile, 9)])
         );
     }
 
     #[test]
     fn test_tokenize_base64() {
-        let tokens = tokenize("~~64'K|(_)");
+        let tokens = tokenize("~~64'K|(_");
 
         assert_eq!(
             tokens,
-            Ok(vec![Token::new(Base64, 5), Token::new(EndOfFile, 10)])
+            Ok(vec![Token::new(Base64, 5), Token::new(EndOfFile, 9)])
         );
     }
 
     #[test]
     fn test_tokenize_base32() {
-        let tokens = tokenize("~~32'K|(_)");
+        let tokens = tokenize("~~32'K|(_");
 
         assert_eq!(
             tokens,
-            Ok(vec![Token::new(Base32, 5), Token::new(EndOfFile, 10)])
+            Ok(vec![Token::new(Base32, 5), Token::new(EndOfFile, 9)])
         );
     }
 
@@ -1710,7 +1751,9 @@ mod tests {
         let mut ast = SyntaxTree::default();
         let mut token_position = 0;
         let tokens = parse(&[], &mut token_position, "", &mut ast, u32::MIN);
-        assert_eq!(tokens, Err((ParseError::NoTokensGiven, 0)));
+
+        assert!(tokens.is_err());
+        assert!(matches!(tokens.err(), Some((ParseError::NoTokensGiven, 0))));
     }
 
     #[test]
@@ -2045,7 +2088,6 @@ mod tests {
         let tokens = tokenize(input).unwrap();
 
         let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
-        ast.dump_dot(_root, "/tmp/dump");
 
         assert_eq!(
             ast,
@@ -2064,7 +2106,6 @@ mod tests {
         let tokens = tokenize(input).unwrap();
 
         let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
-        ast.dump_dot(_root, "/tmp/dump");
 
         assert_eq!(
             ast,
@@ -2075,9 +2116,183 @@ mod tests {
             }
         );
     }
+
     #[test]
-    fn test_parse_bytes_returns_bytes() {
+    fn test_parse_bytes_returns_bytes_base85() {
+        let input = "~~85'K|(_";
+        let mut token_position = 0;
+        let mut ast = SyntaxTree::default();
+        let tokens = tokenize(input).unwrap();
+
+        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![Node::Bytes {
+                    data: "ABC".as_bytes().to_vec()
+                },]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_bytes_returns_bytes_base64() {
         let input = "~~64'QUJD";
+        let mut token_position = 0;
+        let mut ast = SyntaxTree::default();
+        let tokens = tokenize(input).unwrap();
+
+        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![Node::Bytes {
+                    data: "ABC".as_bytes().to_vec()
+                },]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_binary_add_returns_add() {
+        let input = "1+2";
+        let mut token_position = 0;
+        let mut ast = SyntaxTree::default();
+        let tokens = tokenize(input).unwrap();
+
+        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Int { data: 1 },
+                    Node::Int { data: 2 },
+                    Node::Add {
+                        left: NodeId(0),
+                        right: NodeId(1)
+                    }
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_binary_sub_returns_sub() {
+        let input = "1-2";
+        let mut token_position = 0;
+        let mut ast = SyntaxTree::default();
+        let tokens = tokenize(input).unwrap();
+
+        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Int { data: 1 },
+                    Node::Int { data: 2 },
+                    Node::Sub {
+                        left: NodeId(0),
+                        right: NodeId(1)
+                    }
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_binary_add_right_returns_add() {
+        let input = "1+2+3";
+        let mut token_position = 0;
+        let mut ast = SyntaxTree::default();
+        let tokens = tokenize(input).unwrap();
+
+        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Int { data: 1 },
+                    Node::Int { data: 2 },
+                    Node::Add {
+                        left: NodeId(0),
+                        right: NodeId(1)
+                    },
+                    Node::Int { data: 3 },
+                    Node::Add {
+                        left: NodeId(2),
+                        right: NodeId(3)
+                    }
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_binary_add_right_returns_mul() {
+        let input = "1+2*3";
+        let mut token_position = 0;
+        let mut ast = SyntaxTree::default();
+        let tokens = tokenize(input).unwrap();
+
+        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Int { data: 1 },
+                    Node::Int { data: 2 },
+                    Node::Int { data: 3 },
+                    Node::Mul {
+                        left: NodeId(1),
+                        right: NodeId(2)
+                    },
+                    Node::Add {
+                        left: NodeId(0),
+                        right: NodeId(3)
+                    }
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_binary_add_right_returns_mul_left() {
+        let input = "1*2+3";
+        let mut token_position = 0;
+        let mut ast = SyntaxTree::default();
+        let tokens = tokenize(input).unwrap();
+
+        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Int { data: 1 },
+                    Node::Int { data: 2 },
+                    Node::Mul {
+                        left: NodeId(0),
+                        right: NodeId(1)
+                    },
+                    Node::Int { data: 3 },
+                    Node::Add {
+                        left: NodeId(2),
+                        right: NodeId(3)
+                    }
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_exp_binds_tighter_than_mul_right() {
+        let input = "5*2^3";
         let mut token_position = 0;
         let mut ast = SyntaxTree::default();
         let tokens = tokenize(input).unwrap();
@@ -2088,9 +2303,16 @@ mod tests {
         assert_eq!(
             ast,
             SyntaxTree {
-                nodes: vec![Node::Bytes {
-                    data: "ABC".as_bytes().to_vec()
-                },]
+                nodes: vec![
+                    Node::Int { data: 5 },
+                    Node::Int { data: 2 },
+                    Node::Int { data: 3 },
+                    Node::Exp { left: NodeId(1), right: NodeId(2) },
+                    Node::Mul {
+                        left: NodeId(0),
+                        right: NodeId(3)
+                    }
+                ]
             }
         );
     }
