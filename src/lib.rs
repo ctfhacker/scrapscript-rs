@@ -231,6 +231,29 @@ impl Token {
     }
 }
 
+
+/// Errors that can occur during execution of scrapscript
+#[derive(Debug)]
+pub enum Error {
+    /// An error occured during tokenization
+    Tokenize((TokenError, usize)),
+
+    /// An error occured during parsing
+    Parse((ParseError, usize))
+}
+
+impl From<(TokenError, usize)> for Error {
+    fn from(err: (TokenError, usize)) ->  Error {
+        Error::Tokenize(err)
+    }
+}
+
+impl From<(ParseError, usize)> for Error {
+    fn from(err: (ParseError, usize)) ->  Error {
+        Error::Parse(err)
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum TokenError {
     FloatWithMultipleDecimalPoints,
@@ -253,20 +276,20 @@ pub enum ParseError {
     Base64(base64::DecodeError),
 }
 
-macro_rules! impl_err {
-    ($err:ident, $ty:ty) => {
-        impl From<$ty> for  ParseError {
-            fn from (err: $ty) -> ParseError {
-                ParseError::$err(err)
+macro_rules! impl_from_err {
+    ($e:ty, $err:ident, $ty:ty) => {
+        impl From<$ty> for $e {
+            fn from (err: $ty) -> $e {
+                <$e>::$err(err)
             }
         }
     }
 }
 
-impl_err!(Int, std::num::ParseIntError);
-impl_err!(Float, std::num::ParseFloatError);
-impl_err!(Base85, base85::Error);
-impl_err!(Base64, base64::DecodeError);
+impl_from_err!(ParseError, Int, std::num::ParseIntError);
+impl_from_err!(ParseError, Float, std::num::ParseFloatError);
+impl_from_err!(ParseError, Base85, base85::Error);
+impl_from_err!(ParseError, Base64, base64::DecodeError);
 
 /// A basic syntax tree of nodes
 #[derive(Default, Debug, PartialEq)]
@@ -767,13 +790,42 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
     Ok(result)
 }
 
+/// Parse the given input string into a syntax tree
+///
+/// # Errors
+///
+/// * Error occurs during tokenization of input
+/// * Error occurs during parsing of tokens
+pub fn parse_str(input: &str) -> Result<(NodeId, SyntaxTree), Error> {
+    let tokens = tokenize(input)?;
+    Ok(parse(&tokens, input)?)
+}
+
+
+/// Parse the given [`Token`]s into a [`SyntaxTree`]
+///
+/// # Errors
+///
+/// * Error occurs during parsing of tokens
+pub fn parse(
+    tokens: &[Token],
+    input: &str,
+) -> Result<(NodeId, SyntaxTree), (ParseError, usize)> {
+    let mut ast = SyntaxTree::default();
+    let mut token_position = 0;
+
+    let root = _parse(tokens, &mut token_position, input, &mut ast, u32::MIN)?;
+
+    Ok((root, ast))
+}
+
 /// Converts a list of [`Token`] into a [`SyntaxTree`] and returns the root node
 ///
 /// # Errors
 ///
 /// * Errors on parsing tokens and return the position of the error
 #[allow(clippy::too_many_lines)]
-pub fn parse(
+pub fn _parse(
     tokens: &[Token],
     token_index: &mut usize,
     input: &str,
@@ -834,7 +886,7 @@ pub fn parse(
             TokenId::OpSub => {
                 let zero_int = ast.int(0);
 
-                let right = parse(tokens, token_index, input, ast, 5000)?;
+                let right = _parse(tokens, token_index, input, ast, 5000)?;
 
                 ast.sub(zero_int, right)
             }
@@ -907,7 +959,7 @@ pub fn parse(
             // Increment the token index
             *token_index += 1;
 
-            let right = parse(tokens, token_index, input, ast, binary_prescedence)?;
+            let right = _parse(tokens, token_index, input, ast, binary_prescedence)?;
             match binary_op.id {
                 TokenId::EndOfFile => {
                     println!("Hit EOF");
@@ -955,7 +1007,7 @@ pub fn parse(
                 break;
             }
 
-            let right = parse(tokens, token_index, input, ast, current_precedence + 1)?;
+            let right = _parse(tokens, token_index, input, ast, current_precedence + 1)?;
 
             left = ast.apply(left, right);
         }
@@ -1790,9 +1842,7 @@ mod tests {
 
     #[test]
     fn test_parse_empty_tokens() {
-        let mut ast = SyntaxTree::default();
-        let mut token_position = 0;
-        let tokens = parse(&[], &mut token_position, "", &mut ast, u32::MIN);
+        let tokens = parse(&[], "");
 
         assert!(tokens.is_err());
         assert!(matches!(tokens.err(), Some((ParseError::NoTokensGiven, 0))));
@@ -1800,11 +1850,8 @@ mod tests {
 
     #[test]
     fn test_parse_digit_returns_int() {
-        let mut ast = SyntaxTree::default();
-        let mut token_position = 0;
         let input = "1";
-        let tokens = tokenize(input).unwrap();
-        parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        let (_root, ast) = parse_str(input).unwrap();
 
         assert_eq!(
             ast,
@@ -1816,12 +1863,8 @@ mod tests {
 
     #[test]
     fn test_parse_digits_returns_int() {
-        let mut ast = SyntaxTree::default();
-        let mut token_position = 0;
-
         let input = "123";
-        let tokens = tokenize(input).unwrap();
-        parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        let (_root, ast) = parse_str(input).unwrap();
         assert_eq!(
             ast,
             SyntaxTree {
@@ -1832,11 +1875,8 @@ mod tests {
 
     #[test]
     fn test_parse_negative_int_returns_binary_sub_int() {
-        let mut ast = SyntaxTree::default();
-        let mut token_position = 0;
         let input = "-123";
-        let tokens = tokenize(input).unwrap();
-        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        let (_root, ast) = parse_str(input).unwrap();
 
         assert_eq!(
             ast,
@@ -1855,11 +1895,8 @@ mod tests {
 
     #[test]
     fn test_parse_negative_var() {
-        let mut ast = SyntaxTree::default();
-        let mut token_position = 0;
         let input = "-x";
-        let tokens = tokenize(input).unwrap();
-        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        let (_root, ast) = parse_str(input).unwrap();
 
         assert_eq!(
             ast,
@@ -1881,10 +1918,7 @@ mod tests {
     #[test]
     fn test_parse_negative_int_binds_tighter_than_plus() {
         let input = "-l+r";
-        let mut token_position = 0;
-        let mut ast = SyntaxTree::default();
-        let tokens = tokenize(input).unwrap();
-        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        let (_root, ast) = parse_str(input).unwrap();
 
         assert_eq!(
             ast,
@@ -1913,10 +1947,7 @@ mod tests {
     #[test]
     fn test_parse_negative_int_binds_tighter_than_mul() {
         let input = "-l*r";
-        let mut token_position = 0;
-        let mut ast = SyntaxTree::default();
-        let tokens = tokenize(input).unwrap();
-        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        let (_root, ast) = parse_str(input).unwrap();
 
         assert_eq!(
             ast,
@@ -1945,10 +1976,7 @@ mod tests {
     #[test]
     fn test_parse_negative_int_binds_tighter_than_access() {
         let input = "-l@r";
-        let mut token_position = 0;
-        let mut ast = SyntaxTree::default();
-        let tokens = tokenize(input).unwrap();
-        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        let (_root, ast) = parse_str(input).unwrap();
 
         assert_eq!(
             ast,
@@ -1977,11 +2005,7 @@ mod tests {
     #[test]
     fn test_parse_negative_int_binds_tighter_than_apply() {
         let input = "-l r";
-        let mut token_position = 0;
-        let mut ast = SyntaxTree::default();
-        let tokens = tokenize(input).unwrap();
-
-        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        let (_root, ast) = parse_str(input).unwrap();
 
         assert_eq!(
             ast,
@@ -2010,11 +2034,7 @@ mod tests {
     #[test]
     fn test_parse_decimal_return_float() {
         let input = "3.42";
-        let mut token_position = 0;
-        let mut ast = SyntaxTree::default();
-        let tokens = tokenize(input).unwrap();
-
-        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        let (_root, ast) = parse_str(input).unwrap();
 
         assert_eq!(
             ast,
@@ -2026,11 +2046,7 @@ mod tests {
     #[test]
     fn test_parse_decimal_return_returns_binary_sub_float() {
         let input = "-3.42";
-        let mut token_position = 0;
-        let mut ast = SyntaxTree::default();
-        let tokens = tokenize(input).unwrap();
-
-        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        let (_root, ast) = parse_str(input).unwrap();
 
         assert_eq!(
             ast,
@@ -2049,11 +2065,7 @@ mod tests {
     #[test]
     fn test_parse_var_returns_var() {
         let input = "abc_123";
-        let mut token_position = 0;
-        let mut ast = SyntaxTree::default();
-        let tokens = tokenize(input).unwrap();
-
-        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        let (_root, ast) = parse_str(input).unwrap();
 
         assert_eq!(
             ast,
@@ -2068,11 +2080,7 @@ mod tests {
     #[test]
     fn test_parse_sha_var_returns_var() {
         let input = "$sha1'abc";
-        let mut token_position = 0;
-        let mut ast = SyntaxTree::default();
-        let tokens = tokenize(input).unwrap();
-
-        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        let (_root, ast) = parse_str(input).unwrap();
 
         assert_eq!(
             ast,
@@ -2087,11 +2095,7 @@ mod tests {
     #[test]
     fn test_parse_sha_var_quote_returns_var() {
         let input = "$sha1'abc";
-        let mut token_position = 0;
-        let mut ast = SyntaxTree::default();
-        let tokens = tokenize(input).unwrap();
-
-        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        let (_root, ast) = parse_str(input).unwrap();
 
         assert_eq!(
             ast,
@@ -2106,11 +2110,7 @@ mod tests {
     #[test]
     fn test_parse_dollar_dollar_returns_var() {
         let input = "$$";
-        let mut token_position = 0;
-        let mut ast = SyntaxTree::default();
-        let tokens = tokenize(input).unwrap();
-
-        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        let (_root, ast) = parse_str(input).unwrap();
 
         assert_eq!(
             ast,
@@ -2125,11 +2125,7 @@ mod tests {
     #[test]
     fn test_parse_dollar_returns_var() {
         let input = "$";
-        let mut token_position = 0;
-        let mut ast = SyntaxTree::default();
-        let tokens = tokenize(input).unwrap();
-
-        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        let (_root, ast) = parse_str(input).unwrap();
 
         assert_eq!(
             ast,
@@ -2143,11 +2139,7 @@ mod tests {
     #[test]
     fn test_parse_dollar_dollar_return_var() {
         let input = "$$bills";
-        let mut token_position = 0;
-        let mut ast = SyntaxTree::default();
-        let tokens = tokenize(input).unwrap();
-
-        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        let (_root, ast) = parse_str(input).unwrap();
 
         assert_eq!(
             ast,
@@ -2162,11 +2154,7 @@ mod tests {
     #[test]
     fn test_parse_bytes_returns_bytes_base85() {
         let input = "~~85'K|(_";
-        let mut token_position = 0;
-        let mut ast = SyntaxTree::default();
-        let tokens = tokenize(input).unwrap();
-
-        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        let (_root, ast) = parse_str(input).unwrap();
 
         assert_eq!(
             ast,
@@ -2181,11 +2169,7 @@ mod tests {
     #[test]
     fn test_parse_bytes_returns_bytes_base64() {
         let input = "~~64'QUJD";
-        let mut token_position = 0;
-        let mut ast = SyntaxTree::default();
-        let tokens = tokenize(input).unwrap();
-
-        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        let (_root, ast) = parse_str(input).unwrap();
 
         assert_eq!(
             ast,
@@ -2200,11 +2184,7 @@ mod tests {
     #[test]
     fn test_parse_binary_add_returns_add() {
         let input = "1+2";
-        let mut token_position = 0;
-        let mut ast = SyntaxTree::default();
-        let tokens = tokenize(input).unwrap();
-
-        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        let (_root, ast) = parse_str(input).unwrap();
 
         assert_eq!(
             ast,
@@ -2224,11 +2204,7 @@ mod tests {
     #[test]
     fn test_parse_binary_sub_returns_sub() {
         let input = "1-2";
-        let mut token_position = 0;
-        let mut ast = SyntaxTree::default();
-        let tokens = tokenize(input).unwrap();
-
-        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        let (_root, ast) = parse_str(input).unwrap();
 
         assert_eq!(
             ast,
@@ -2248,11 +2224,7 @@ mod tests {
     #[test]
     fn test_parse_binary_add_right_returns_add() {
         let input = "1+2+3";
-        let mut token_position = 0;
-        let mut ast = SyntaxTree::default();
-        let tokens = tokenize(input).unwrap();
-
-        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        let (_root, ast) = parse_str(input).unwrap();
 
         assert_eq!(
             ast,
@@ -2277,11 +2249,7 @@ mod tests {
     #[test]
     fn test_parse_binary_add_right_returns_mul() {
         let input = "1+2*3";
-        let mut token_position = 0;
-        let mut ast = SyntaxTree::default();
-        let tokens = tokenize(input).unwrap();
-
-        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        let (_root, ast) = parse_str(input).unwrap();
 
         assert_eq!(
             ast,
@@ -2306,11 +2274,7 @@ mod tests {
     #[test]
     fn test_parse_binary_add_right_returns_mul_left() {
         let input = "1*2+3";
-        let mut token_position = 0;
-        let mut ast = SyntaxTree::default();
-        let tokens = tokenize(input).unwrap();
-
-        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        let (_root, ast) = parse_str(input).unwrap();
 
         assert_eq!(
             ast,
@@ -2335,11 +2299,7 @@ mod tests {
     #[test]
     fn test_exp_binds_tighter_than_mul_right() {
         let input = "5*2^3";
-        let mut token_position = 0;
-        let mut ast = SyntaxTree::default();
-        let tokens = tokenize(input).unwrap();
-
-        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        let (_root, ast) = parse_str(input).unwrap();
 
         assert_eq!(
             ast,
@@ -2361,11 +2321,7 @@ mod tests {
     #[test]
     fn test_list_access_binds_tighter_than_append() {
         let input = "a +< ls@0";
-        let mut token_position = 0;
-        let mut ast = SyntaxTree::default();
-        let tokens = tokenize(input).unwrap();
-
-        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        let (_root, ast) = parse_str(input).unwrap();
 
         assert_eq!(
             ast,
@@ -2384,12 +2340,7 @@ mod tests {
     #[test]
     fn test_parse_binary_str_concat() {
         let input = "abc ++ def";
-        let mut token_position = 0;
-        let mut ast = SyntaxTree::default();
-        let tokens = tokenize(input).unwrap();
-        dbg!(&tokens);
-
-        let root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        let (root, ast) = parse_str(input).unwrap();
         let _ = ast.dump_dot(root, "/tmp/dump");
 
         assert_eq!(
