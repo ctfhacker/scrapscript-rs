@@ -120,7 +120,33 @@ pub enum TokenId {
     EndOfFile,
 }
 
+impl TryFrom<&str> for TokenId {
+    pub fn from(&self, input: &str) -> Option<u32> {
+        match input {
+            "+" => Some(TokenId::OpAdd),
+            "-" => Some(TokenId::OpSub),
+            "*" => Some(TokenId::OpMul),
+            "/" => Some(TokenId::OpDiv),
+            "^" => Some(TokenId::OpExp),
+            "%" => Some(TokenId::OpMod),
+            "==" => Some(TokenId::OpEqual),
+            "/=" => Some(TokenId::OpNotEqual),
+            "<" => Some(TokenId::OpLess),
+            ">" => Some(TokenId::OpGreater),
+            "<=" => Some(TokenId::OpLessEqual),
+            ">=" => Some(TokenId::OpGreaterEqual),
+            "&&" => Some(TokenId::OpBoolAnd),
+            "||" => Some(TokenId::OpBoolOr),
+            "++" => Some(TokenId::OpListCons),
+            ">+" => Some(TokenId::OpAdd),
+            "+<" => Some(TokenId::OpAdd),
+            _ => None
+        }
+    }
+}
+
 impl TokenId {
+
     #[must_use]
     pub fn get_op_prescedence(&self) -> Option<u32> {
         #[allow(clippy::enum_glob_use)]
@@ -2380,5 +2406,47 @@ mod tests {
                 ]
             }
         );
+    }
+
+    #[test]
+    fn test_parse_binary_list_append() {
+        let input = "a +< c";
+        let (root, ast) = parse_str(input).unwrap();
+        let _ = ast.dump_dot(root, "/tmp/dump");
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Var{ data: "a".to_string() },
+                    Node::Var{ data: "c".to_string() },
+                    Node::ListAppend { left: NodeId(0), right: NodeId(1) },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_binary_op() {
+        let ops = [
+            "+", "-", "*", "/", "^", "%", "==", "/=", "<", ">", "<=", ">=", "&&", "||", "++", ">+", "+<"
+        ];
+
+        for op in ops {
+            let input = format!("a {op} c");
+            let (root, ast) = parse_str(input).unwrap();
+            let _ = ast.dump_dot(root, "/tmp/dump");
+
+            assert_eq!(
+                ast,
+                SyntaxTree {
+                    nodes: vec![
+                        Node::Var{ data: "a".to_string() },
+                        Node::Var{ data: "c".to_string() },
+                        Node::ListAppend { left: NodeId(0), right: NodeId(1) },
+                    ]
+                }
+            );
+        }
     }
 }
