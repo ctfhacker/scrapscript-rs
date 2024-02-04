@@ -130,7 +130,7 @@ impl TokenId {
             OpExp => Some(130),
             OpMul | OpDiv | OpFloorDiv | OpMod => Some(120),
             OpSub | OpAdd => Some(110),
-            OpListCons | OpListAppend => Some(100),
+            OpListCons | OpListAppend | OpStrConcat => Some(100),
             OpEqual | OpNotEqual | OpLess | OpGreater | OpLessEqual | OpGreaterEqual => Some(90),
             OpBoolAnd => Some(80),
             OpBoolOr => Some(70),
@@ -185,6 +185,12 @@ pub enum Node {
 
     /// An apply operation between two nodes
     Apply { left: NodeId, right: NodeId },
+
+    /// A list append operation between two nodes
+    ListAppend { left: NodeId, right: NodeId },
+
+    /// A string concatination operation between two nodes
+    StrConcat  { left: NodeId, right: NodeId },
 }
 
 impl Node {
@@ -201,8 +207,10 @@ impl Node {
             Node::Mul { .. } => format!("*"),
             Node::Exp { .. } => format!("^"),
             Node::GreaterThan { .. } => format!(">"),
-            Node::Access { .. } => format!("@"),
+            Node::Access { .. } => format!("@ (ACCESS) "),
             Node::Apply { .. } => format!("APPLY"),
+            Node::ListAppend { .. } => format!("+< (LIST_APPEND)"),
+            Node::StrConcat { .. } => format!("++ (STR_CONCAT)"),
         }
     }
 }
@@ -307,6 +315,8 @@ impl SyntaxTree {
     impl_left_right_node!(access, Access);
     impl_left_right_node!(apply, Apply);
     impl_left_right_node!(exp, Exp);
+    impl_left_right_node!(list_append, ListAppend);
+    impl_left_right_node!(str_concat, StrConcat);
 
     /// Dump a .dot of this syntax tree
     pub fn dump_dot(&self, root: NodeId, out_name: &str) {
@@ -332,6 +342,8 @@ impl SyntaxTree {
                 | Node::GreaterThan { left, right }
                 | Node::Exp { left, right }
                 | Node::Apply { left, right }
+                | Node::ListAppend { left, right }
+                | Node::StrConcat { left, right }
                 | Node::Access { left, right } => {
                     queue.push(*left);
                     queue.push(*right);
@@ -903,6 +915,14 @@ pub fn parse(
 
                 TokenId::OpAccess => {
                     left = ast.access(left, right);
+                }
+
+                TokenId::OpListAppend => {
+                    left = ast.list_append(left, right);
+                }
+
+                TokenId::OpStrConcat => {
+                    left = ast.str_concat(left, right);
                 }
 
                 x => panic!("Unknown operator token: {x:?}"),
@@ -2298,7 +2318,6 @@ mod tests {
         let tokens = tokenize(input).unwrap();
 
         let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
-        ast.dump_dot(_root, "/tmp/dump");
 
         assert_eq!(
             ast,
@@ -2312,6 +2331,53 @@ mod tests {
                         left: NodeId(0),
                         right: NodeId(3)
                     }
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_list_access_binds_tighter_than_append() {
+        let input = "a +< ls@0";
+        let mut token_position = 0;
+        let mut ast = SyntaxTree::default();
+        let tokens = tokenize(input).unwrap();
+
+        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        ast.dump_dot(_root, "/tmp/dump");
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Var{ data: "a".to_string() },
+                    Node::Var{ data: "ls".to_string() },
+                    Node::Int { data: 0 },
+                    Node::Access { left: NodeId(1), right: NodeId(2) },
+                    Node::ListAppend{ left: NodeId(0), right: NodeId(3) },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_binary_str_concat() {
+        let input = "abc ++ def";
+        let mut token_position = 0;
+        let mut ast = SyntaxTree::default();
+        let tokens = tokenize(input).unwrap();
+        dbg!(&tokens);
+
+        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        ast.dump_dot(_root, "/tmp/dump");
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Var{ data: "abc".to_string() },
+                    Node::Var{ data: "def".to_string() },
+                    Node::StrConcat { left: NodeId(0), right: NodeId(1) },
                 ]
             }
         );
