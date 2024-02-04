@@ -121,7 +121,9 @@ pub enum TokenId {
 }
 
 impl TokenId {
+    #[must_use]
     pub fn get_op_prescedence(&self) -> Option<u32> {
+        #[allow(clippy::enum_glob_use)]
         use TokenId::*;
 
         match self {
@@ -144,7 +146,7 @@ impl TokenId {
             OpSpread => Some(0),
             x => {
                 println!("Unknown operator prescedence: {x:?}");
-                return None;
+                None
             }
         }
     }
@@ -194,23 +196,24 @@ pub enum Node {
 }
 
 impl Node {
+    #[must_use]
     pub fn label(&self) -> String {
         match self {
             Node::Int { data } => format!("{data:#x} ({data})"),
             Node::Float { data } => format!("{data:.4}"),
-            Node::Var { data } => format!("{data}"),
+            Node::Var { data } => data.to_string(),
             Node::Bytes { data } => {
                 format!("{:?}", data.iter().map(|x| *x as char).collect::<Vec<_>>())
             }
-            Node::Sub { .. } => format!("-"),
-            Node::Add { .. } => format!("+"),
-            Node::Mul { .. } => format!("*"),
-            Node::Exp { .. } => format!("^"),
-            Node::GreaterThan { .. } => format!(">"),
-            Node::Access { .. } => format!("@ (ACCESS) "),
-            Node::Apply { .. } => format!("APPLY"),
-            Node::ListAppend { .. } => format!("+< (LIST_APPEND)"),
-            Node::StrConcat { .. } => format!("++ (STR_CONCAT)"),
+            Node::Sub { .. } => "-".to_string(),
+            Node::Add { .. } => "+".to_string(),
+            Node::Mul { .. } => "*".to_string(),
+            Node::Exp { .. } => "^".to_string(),
+            Node::GreaterThan { .. } => ">".to_string(),
+            Node::Access { .. } => "@ (ACCESS) ".to_string(),
+            Node::Apply { .. } => "APPLY".to_string(),
+            Node::ListAppend { .. } => "+< (LIST_APPEND)".to_string(),
+            Node::StrConcat { .. } => "++ (STR_CONCAT)".to_string(),
         }
     }
 }
@@ -222,6 +225,7 @@ pub struct Token {
 }
 
 impl Token {
+    #[must_use]
     pub fn new(id: TokenId, pos: u32) -> Self {
         Self { id, pos }
     }
@@ -235,16 +239,34 @@ pub enum TokenError {
     UnquotedEndOfString,
     UnexpectedEndOfFile,
     InvalidSymbol,
+    UnknownCharacter(char)
 }
 
 #[derive(Debug)]
 pub enum ParseError {
+    UnknownToken(TokenId),
+    UnknownOperatorToken(TokenId),
     NoTokensGiven,
     Int(std::num::ParseIntError),
     Float(std::num::ParseFloatError),
     Base85(base85::Error),
     Base64(base64::DecodeError),
 }
+
+macro_rules! impl_err {
+    ($err:ident, $ty:ty) => {
+        impl From<$ty> for  ParseError {
+            fn from (err: $ty) -> ParseError {
+                ParseError::$err(err)
+            }
+        }
+    }
+}
+
+impl_err!(Int, std::num::ParseIntError);
+impl_err!(Float, std::num::ParseFloatError);
+impl_err!(Base85, base85::Error);
+impl_err!(Base64, base64::DecodeError);
 
 /// A basic syntax tree of nodes
 #[derive(Default, Debug, PartialEq)]
@@ -319,7 +341,11 @@ impl SyntaxTree {
     impl_left_right_node!(str_concat, StrConcat);
 
     /// Dump a .dot of this syntax tree
-    pub fn dump_dot(&self, root: NodeId, out_name: &str) {
+    ///
+    /// # Errors
+    /// 
+    /// * Failed to write the dot file
+    pub fn dump_dot(&self, root: NodeId, out_name: &str) -> Result<(), std::io::Error> {
         let mut queue = vec![root];
         let mut seen_nodes = HashSet::new();
 
@@ -363,14 +389,18 @@ impl SyntaxTree {
 
         println!("{dot}");
 
-        std::fs::write(out_name, dot).expect("Failed to write dot file");
+        std::fs::write(out_name, dot)
     }
 }
 
 /// Convert the input program into a list of tokens
+///
+/// # Errors
+///
+/// * Token parsing error along with the position where the error occured
+#[allow(clippy::too_many_lines)]
 pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
     let mut result = Vec::new();
-    let input: &str = input.into();
     let input = input.as_bytes();
 
     let mut index = 0;
@@ -378,13 +408,20 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
 
     let mut pos;
 
+    
     'done: loop {
-        if index >= input.len() {
-            result.push(Token {
-                id: TokenId::EndOfFile,
-                pos: index as u32,
-            });
-            break 'done;
+        macro_rules! check_eof {
+            () => {
+                if index >= input.len() {
+                    result.push(Token {
+                        id: TokenId::EndOfFile,
+                        pos: input.len() as u32,
+                    });
+                    break 'done;
+                }
+            
+            }
+        
         }
 
         macro_rules! continue_while_space {
@@ -393,13 +430,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
                 while matches!(input[index], b' ' | b'\n' | b'\r' | b'\t') {
                     index += 1;
 
-                    if index >= input.len() {
-                        result.push(Token {
-                            id: TokenId::EndOfFile,
-                            pos: input.len() as u32,
-                        });
-                        break 'done;
-                    }
+                    check_eof!();
 
                     // Tags are split by spaces. If we see a space, reset the current token
                     in_token = false;
@@ -412,14 +443,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
                 // Skip over all whitespace. Reset the current token when hitting whitespace.
                 while matches!(input[index], $until) {
                     index += 1;
-
-                    if index >= input.len() {
-                        result.push(Token {
-                            id: TokenId::EndOfFile,
-                            pos: input.len() as u32,
-                        });
-                        break 'done;
-                    }
+                    check_eof!();
                 }
             };
         }
@@ -464,6 +488,8 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
                 }
             };
         }
+
+        check_eof!();
 
         // Continue past the whitespace
         continue_while_space!();
@@ -541,6 +567,10 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
             [b'0'..=b'9' | b'.', ..] => {
                 let mut id = TokenId::Int;
 
+
+                #[allow(clippy::cast_possible_truncation)]
+                let pos = pos as u32;
+
                 // Read all digits and potential '.' for floats
                 while matches!(input[index], b'0'..=b'9' | b'.') {
                     if input[index] == b'.' {
@@ -553,18 +583,20 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
 
                     index += 1;
 
-                    if index >= input.len() {
-                        result.push(Token::new(id, pos as u32));
 
+                    if index >= input.len() {
+                        result.push(Token::new(id, pos));
+
+                        #[allow(clippy::cast_possible_truncation)]
                         result.push(Token {
                             id: TokenId::EndOfFile,
-                            pos: index as u32,
+                            pos: input.len() as u32,
                         });
                         break 'done;
                     }
                 }
 
-                result.push(Token::new(id, pos as u32));
+                result.push(Token::new(id, pos));
                 in_token = false;
             }
 
@@ -585,13 +617,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
 
                     index += 1;
 
-                    if index >= input.len() {
-                        result.push(Token {
-                            id: TokenId::EndOfFile,
-                            pos: index as u32,
-                        });
-                        break 'done;
-                    }
+                    check_eof!();
                 }
             }
             [b'-', b'>', ..] => {
@@ -653,22 +679,15 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
                     index += 1;
                     is_empty = false;
 
-                    if index >= input.len() {
-                        result.push(Token {
-                            id: TokenId::EndOfFile,
-                            pos: index as u32,
-                        });
-
-                        break 'done;
-                    }
+                    check_eof!();
                 }
 
                 if is_empty {
                     if index >= input.len() {
                         return Err((TokenError::UnexpectedEndOfFile, pos));
-                    } else {
-                        return Err((TokenError::InvalidSymbol, pos));
                     }
+
+                    return Err((TokenError::InvalidSymbol, pos));
                 }
             }
             [b'*', ..] => {
@@ -735,12 +754,12 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
                 set_token!(OpSub, 1);
 
                 // Reset the token for negative numbers -123 vs subtract of a - 123
-                if matches!(input[index], b'0'..=b'9') {
+                if input[index].is_ascii_digit() {
                     in_token = false;
                 }
             }
-            _ => {
-                panic!("Unknown {}", input[index] as char);
+            x => {
+                return Err((TokenError::UnknownCharacter(x[0] as char), pos));
             }
         }
     }
@@ -748,6 +767,12 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
     Ok(result)
 }
 
+/// Converts a list of [`Token`] into a [`SyntaxTree`] and returns the root node
+///
+/// # Errors
+///
+/// * Errors on parsing tokens and return the position of the error
+#[allow(clippy::too_many_lines)]
 pub fn parse(
     tokens: &[Token],
     token_index: &mut usize,
@@ -818,10 +843,6 @@ pub fn parse(
                 let name = input[input_index..=end_input_index].to_string();
                 ast.name(name)
             }
-            TokenId::OpAdd => {
-                panic!("Hit Add as a left operation!?")
-            }
-
             TokenId::Base85 => {
                 continue_while!(b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | 
                     b'!' | b'#' | b'$' | b'%' | b'&' | b'(' | b')' | b'*' | 
@@ -847,7 +868,7 @@ pub fn parse(
                 // Create the decoded bytes string
                 ast.bytes(bytes)
             }
-            x => panic!("Unknown parse token: {x:?}"),
+            x => return Err((ParseError::UnknownToken(x), start.pos as usize)),
         };
 
         Ok(leaf)
@@ -925,12 +946,12 @@ pub fn parse(
                     left = ast.str_concat(left, right);
                 }
 
-                x => panic!("Unknown operator token: {x:?}"),
+                x => return Err((ParseError::UnknownOperatorToken(x), binary_op.pos as usize)),
             }
         } else {
             println!("Not a bin op: {next:?}");
 
-            if TokenId::OpAccess.get_op_prescedence().unwrap() < current_precedence {
+            if TokenId::OpAccess.get_op_prescedence().unwrap_or(1000) < current_precedence {
                 break;
             }
 
@@ -1060,6 +1081,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cast_possible_truncation)]
     fn test_tokensize_binop_var() {
         for (op, ident) in [
             ("+", OpAdd),
@@ -1987,7 +2009,7 @@ mod tests {
 
     #[test]
     fn test_parse_decimal_return_float() {
-        let input = "3.14";
+        let input = "3.42";
         let mut token_position = 0;
         let mut ast = SyntaxTree::default();
         let tokens = tokenize(input).unwrap();
@@ -1997,13 +2019,13 @@ mod tests {
         assert_eq!(
             ast,
             SyntaxTree {
-                nodes: vec![Node::Float { data: 3.14 },]
+                nodes: vec![Node::Float { data: 3.42 },]
             }
         );
     }
     #[test]
     fn test_parse_decimal_return_returns_binary_sub_float() {
-        let input = "-3.14";
+        let input = "-3.42";
         let mut token_position = 0;
         let mut ast = SyntaxTree::default();
         let tokens = tokenize(input).unwrap();
@@ -2015,7 +2037,7 @@ mod tests {
             SyntaxTree {
                 nodes: vec![
                     Node::Int { data: 0 },
-                    Node::Float { data: 3.14 },
+                    Node::Float { data: 3.42 },
                     Node::Sub {
                         left: NodeId(0),
                         right: NodeId(1)
@@ -2344,7 +2366,6 @@ mod tests {
         let tokens = tokenize(input).unwrap();
 
         let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
-        ast.dump_dot(_root, "/tmp/dump");
 
         assert_eq!(
             ast,
@@ -2368,8 +2389,8 @@ mod tests {
         let tokens = tokenize(input).unwrap();
         dbg!(&tokens);
 
-        let _root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
-        ast.dump_dot(_root, "/tmp/dump");
+        let root = parse(&tokens, &mut token_position, input, &mut ast, u32::MIN).unwrap();
+        let _ = ast.dump_dot(root, "/tmp/dump");
 
         assert_eq!(
             ast,
