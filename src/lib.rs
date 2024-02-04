@@ -193,6 +193,9 @@ pub enum Node {
 
     /// A string concatination operation between two nodes
     StrConcat  { left: NodeId, right: NodeId },
+
+    /// A list cons operation between two nodes
+    ListCons  { left: NodeId, right: NodeId },
 }
 
 impl Node {
@@ -214,6 +217,7 @@ impl Node {
             Node::Apply { .. } => "APPLY".to_string(),
             Node::ListAppend { .. } => "+< (LIST_APPEND)".to_string(),
             Node::StrConcat { .. } => "++ (STR_CONCAT)".to_string(),
+            Node::ListCons { .. } => ">+ (LIST_CONS)".to_string(),
         }
     }
 }
@@ -362,6 +366,7 @@ impl SyntaxTree {
     impl_left_right_node!(exp, Exp);
     impl_left_right_node!(list_append, ListAppend);
     impl_left_right_node!(str_concat, StrConcat);
+    impl_left_right_node!(list_cons, ListCons);
 
     /// Dump a .dot of this syntax tree
     ///
@@ -393,6 +398,7 @@ impl SyntaxTree {
                 | Node::Apply { left, right }
                 | Node::ListAppend { left, right }
                 | Node::StrConcat { left, right }
+                | Node::ListCons { left, right }
                 | Node::Access { left, right } => {
                     queue.push(*left);
                     queue.push(*right);
@@ -996,6 +1002,10 @@ pub fn _parse(
 
                 TokenId::OpStrConcat => {
                     left = ast.str_concat(left, right);
+                }
+
+                TokenId::OpListCons => {
+                    left = ast.list_cons(left, right);
                 }
 
                 x => return Err((ParseError::UnknownOperatorToken(x), binary_op.pos as usize)),
@@ -2340,8 +2350,7 @@ mod tests {
     #[test]
     fn test_parse_binary_str_concat() {
         let input = "abc ++ def";
-        let (root, ast) = parse_str(input).unwrap();
-        let _ = ast.dump_dot(root, "/tmp/dump");
+        let (_root, ast) = parse_str(input).unwrap();
 
         assert_eq!(
             ast,
@@ -2350,6 +2359,24 @@ mod tests {
                     Node::Var{ data: "abc".to_string() },
                     Node::Var{ data: "def".to_string() },
                     Node::StrConcat { left: NodeId(0), right: NodeId(1) },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_binary_list_cons() {
+        let input = "a >+ c";
+        let (root, ast) = parse_str(input).unwrap();
+        let _ = ast.dump_dot(root, "/tmp/dump");
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Var{ data: "a".to_string() },
+                    Node::Var{ data: "c".to_string() },
+                    Node::ListCons { left: NodeId(0), right: NodeId(1) },
                 ]
             }
         );
