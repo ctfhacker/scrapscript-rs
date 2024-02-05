@@ -148,30 +148,70 @@ impl TryFrom<&str> for TokenId {
 }
 
 impl TokenId {
-
+    /// Provides operator precedence. The two values given are:
+    ///
+    /// * The value passed into the recursive parse function
+    /// * The value checked to determine which operator has precedence
+    ///
+    /// The two values allow for having different precedence values for comparing the 
+    /// same operation back-to-back. 
+    ///
+    /// If the value is >=, we have a right leaning tree.
+    /// If the value is <,  we have a left leaning tree.
+    ///
+    /// Example:
+    ///
+    /// Where - For two WHERE operations, back to back, we want the first to have more precendence
+    ///
+    /// ```ignore
+    /// a . b . c
+    /// ````
+    /// ```ignore
+    ///      .
+    ///     / \
+    ///    .   c
+    ///   / \
+    ///  a   b
+    /// ```
+    ///
+    /// Function - For two FUNCTION operations, back to back, we want the second to have more precedence
+    ///
+    /// ```ignore
+    /// a -> b -> c + d
+    /// ```
+    /// ```ignore
+    ///       ->
+    ///      /  \
+    ///     a   ->
+    ///        /  \
+    ///       b    +
+    ///           / \
+    ///          c   d
+    /// ```
     #[must_use]
-    pub fn get_op_prescedence(&self) -> Option<u32> {
+    pub fn get_op_precedence(&self) -> Option<(u32, u32)> {
         #[allow(clippy::enum_glob_use)]
         use TokenId::*;
 
         match self {
-            OpAccess => Some(1001),
-            OpComposeReverse | OpCompose => Some(140),
-            OpExp => Some(130),
-            OpMul | OpDiv | OpFloorDiv | OpMod => Some(120),
-            OpSub | OpAdd => Some(110),
-            OpListCons | OpListAppend | OpStrConcat => Some(100),
-            OpEqual | OpNotEqual | OpLess | OpGreater | OpLessEqual | OpGreaterEqual => Some(90),
-            OpAnd => Some(80),
-            OpOr => Some(70),
-            OpPipe | OpReversePipe => Some(60),
-            OpFunction => Some(50),
-            OpMatchCase => Some(42),
-            OpHasType => Some(41),
-            OpAssign => Some(40),
-            OpRightEval | OpWhere | OpAssert => Some(30),
-            Comma => Some(10),
-            OpSpread => Some(0),
+            OpAccess => Some((1001, 1001)),
+            OpComposeReverse | OpCompose => Some((140, 140)),
+            OpExp => Some((130, 130)),
+            OpMul | OpDiv | OpFloorDiv | OpMod => Some((120, 120)),
+            OpSub | OpAdd => Some((110, 110)),
+            OpListCons | OpListAppend | OpStrConcat => Some((100, 100)),
+            OpEqual | OpNotEqual | OpLess | OpGreater | OpLessEqual | OpGreaterEqual => Some((90, 90)),
+            OpAnd => Some((80, 80)),
+            OpOr => Some((70, 70)),
+            OpPipe => Some((60, 59)),
+            OpReversePipe => Some((60, 60)),
+            OpFunction => Some((50, 51)),
+            OpMatchCase => Some((42, 42)),
+            OpHasType => Some((41, 41)),
+            OpAssign => Some((40, 40)),
+            OpRightEval | OpWhere | OpAssert => Some((30, 29)),
+            Comma => Some((10, 10)),
+            OpSpread => Some((0, 0)),
             x => {
                 println!("Unknown operator prescedence: {x:?}");
                 None
@@ -183,6 +223,9 @@ impl TokenId {
 /// Abstract syntax tree nodes
 #[derive(Debug, Clone, PartialEq)]
 pub enum Node {
+    /// A hole node
+    Hole,
+
     /// An integer value (leaf)
     Int { data: i64 },
 
@@ -195,8 +238,14 @@ pub enum Node {
     /// A vec of bytes
     Bytes { data: Vec<u8> },
 
-    /// A vec of things?
-    List { data: Vec<Node> },
+    /// A vec of nodes
+    List { data: Vec<NodeId> },
+
+    /// A record of nodes
+    Record { keys: Vec<NodeId>, values: Vec<NodeId> },
+
+    /// An assign operation
+    Assign { left: NodeId, right: NodeId },
 
     /// A exponentiation operation
     Exp { left: NodeId, right: NodeId },
@@ -254,16 +303,32 @@ pub enum Node {
 
     /// A list cons operation between two nodes
     ListCons  { left: NodeId, right: NodeId },
+
+    /// A where operation
+    Where { left: NodeId, right: NodeId },
+
+    /// An assert operation
+    Assert { left: NodeId, right: NodeId },
+
+    /// A hastype operation
+    HasType { left: NodeId, right: NodeId },
+
+    /// A function operation
+    Function { name: NodeId, body: NodeId },
+
 }
 
 impl Node {
     #[must_use]
     pub fn label(&self) -> String {
         match self {
-            Node::Int { data } => format!("{data:#x} ({data})"),
+            Node::Int { data } => format!("{data:#x}"),
             Node::Float { data } => format!("{data:.4}"),
-            Node::List { data } => {
-                format!("{:?}", data.iter().map(Node::label).collect::<Vec<_>>())
+            Node::List { .. } => {
+                format!("LIST")
+            }
+            Node::Record { .. } => {
+                format!("RECORD")
             }
             Node::Var { data } => data.to_string(),
             Node::Bytes { data } => {
@@ -288,6 +353,12 @@ impl Node {
             Node::ListAppend { .. } => "+< (LIST_APPEND)".to_string(),
             Node::StrConcat { .. } => "++ (STR_CONCAT)".to_string(),
             Node::ListCons { .. } => ">+ (LIST_CONS)".to_string(),
+            Node::Assign { .. } => "= (ASSIGN)".to_string(),
+            Node::Function { .. } => "-> (FUNCTION)".to_string(),
+            Node::Where { .. } => ". (WHERE)".to_string(),
+            Node::Assert { .. } => "? (ASSERT)".to_string(),
+            Node::HasType { .. } => ": (HAS_TYPE)".to_string(),
+            Node::Hole => "()".to_string(),
         }
     }
 }
@@ -344,6 +415,12 @@ pub enum ParseError {
     UnknownToken(TokenId),
     UnknownOperatorToken(TokenId),
     NoTokensGiven,
+
+    /// Comma in list found before another valid token.
+    /// Ex: [,] or [,,]
+    ListCommaBeforeToken,
+    RecordCommaBeforeToken,
+
     Int(std::num::ParseIntError),
     Float(std::num::ParseFloatError),
     Base85(base85::Error),
@@ -427,6 +504,7 @@ impl SyntaxTree {
     impl_data_node!(float, Float, f64);
     impl_data_node!(name, Var, String);
     impl_data_node!(bytes, Bytes, Vec<u8>);
+    impl_data_node!(list, List, Vec<NodeId>);
     impl_left_right_node!(sub, Sub);
     impl_left_right_node!(add, Add);
     impl_left_right_node!(mul, Mul);
@@ -446,6 +524,39 @@ impl SyntaxTree {
     impl_left_right_node!(list_append, ListAppend);
     impl_left_right_node!(str_concat, StrConcat);
     impl_left_right_node!(list_cons, ListCons);
+    impl_left_right_node!(assign, Assign);
+    impl_left_right_node!(where_op, Where);
+    impl_left_right_node!(assert, Assert);
+    impl_left_right_node!(has_type, HasType);
+
+    pub fn hole(&mut self) -> NodeId {
+        let node_index = self.nodes.len();
+
+        let node = Node::Hole;
+        self.nodes.push(node);
+
+        NodeId(node_index)
+    }
+
+    /// Insert a record node with the given `keys` and `values`
+    pub fn record(&mut self, keys: Vec<NodeId>, values: Vec<NodeId>) -> NodeId {
+        let node_index = self.nodes.len();
+
+        let node = Node::Record { keys, values };
+        self.nodes.push(node);
+
+        NodeId(node_index)
+    }
+
+    /// Insert a function node with the given `name` and `body`
+    pub fn function(&mut self, name: NodeId, body: NodeId) -> NodeId {
+        let node_index = self.nodes.len();
+
+        let node = Node::Function { name, body};
+        self.nodes.push(node);
+
+        NodeId(node_index)
+    }
 
     /// Dump a .dot of this syntax tree
     ///
@@ -466,7 +577,10 @@ impl SyntaxTree {
 
             let curr_node = &self.nodes[node_id];
 
-            dot.push_str(&format!("{node_id} [ label = {:?} ];\n", curr_node.label()));
+            // List nodes are special
+            if !matches!(curr_node, Node::List {.. } | Node::Record { .. }) {
+                dot.push_str(&format!("{node_id} [ label = {:?} ];\n", curr_node.label()));
+            }
 
             match curr_node {
                 Node::Sub { left, right }
@@ -487,6 +601,10 @@ impl SyntaxTree {
                 | Node::NotEqual { left, right }
                 | Node::BoolAnd { left, right }
                 | Node::BoolOr { left, right }
+                | Node::Assign { left, right }
+                | Node::Where { left, right }
+                | Node::Assert { left, right }
+                | Node::HasType { left, right }
                 | Node::Access { left, right } => {
                     queue.push(*left);
                     queue.push(*right);
@@ -494,9 +612,41 @@ impl SyntaxTree {
                     dot.push_str(&format!("{node_id} -> {left}  [ label=\"left\"; ];\n"));
                     dot.push_str(&format!("{node_id} -> {right} [ label=\"right\"; ];\n"));
                 }
+                Node::Function { name, body} => {
+                    queue.push(*name);
+                    queue.push(*body);
+
+                    dot.push_str(&format!("{node_id} -> {name}  [ label=\"name\"; ];\n"));
+                    dot.push_str(&format!("{node_id} -> {body} [ label=\"body\"; ];\n"));
+                }
+                Node::List { data} => {
+                    let label = data
+                        .iter()
+                        .enumerate().map(|(i, _)| format!("<f{i}> .{i}")).collect::<Vec<_>>().join(" | ");
+
+                    dot.push_str(&format!("node [shape=record]; {node_id} [ label = \"{label}\" ];\n"));
+
+                    for (i, child_node_id) in data.iter().enumerate() {
+                        queue.push(*child_node_id);
+                        dot.push_str(&format!("{node_id}:f{i} -> {child_node_id}\n"));
+                    }
+                }
+                Node::Record{ keys, values }=> {
+                    let label = keys
+                        .iter()
+                        .enumerate()
+                        .map(|(i, value)| format!("<f{i}> .{}", self.nodes[*value].label())).collect::<Vec<_>>().join("|");
+
+                    dot.push_str(&format!("node [shape=record]; {node_id} [ label = \"{label}\" ];\n"));
+
+                    for (i, child_node_id) in values.iter().enumerate() {
+                        queue.push(*child_node_id);
+                        dot.push_str(&format!("{node_id}:f{i} -> {child_node_id};\n"));
+                    }
+                }
 
 
-                Node::Int { .. } | Node::Float { .. } | Node::Var { .. } | Node::Bytes { .. } | Node::List { .. } => {
+                Node::Int { .. } | Node::Float { .. } | Node::Var { .. } | Node::Bytes { .. } | Node::Hole => {
                     // This is a leaf node.. nothing else to parse
                 }
             }
@@ -847,19 +997,19 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
             [b')', ..] => {
                 set_token!(RightParen, 1);
             }
-            [b'{', ..] => {
+            [b'[', ..] => {
                 set_token!(LeftBracket, 1);
             }
-            [b'}', ..] => {
+            [b']', ..] => {
                 set_token!(RightBracket, 1);
             }
             [b',', ..] => {
                 set_token!(Comma, 1);
             }
-            [b'[', ..] => {
+            [b'{', ..] => {
                 set_token!(LeftBrace, 1);
             }
-            [b']', ..] => {
+            [b'}', ..] => {
                 set_token!(RightBrace, 1);
             }
             [b'?', ..] => {
@@ -928,7 +1078,7 @@ pub fn _parse(
         return Err((ParseError::NoTokensGiven, 0));
     }
 
-    let input_bytes = input.as_bytes();
+    dbg!(tokens[*token_index]);
 
     let parse_leaf = |ast: &mut SyntaxTree,
                       token_index: &mut usize|
@@ -943,6 +1093,8 @@ pub fn _parse(
 
         macro_rules! continue_while {
             ($pat:pat) => {
+                let input_bytes = input.as_bytes();
+
                 // Skip over all whitespace. Reset the current token when hitting whitespace.
                 while end_input_index > input_index && !matches!(input_bytes[end_input_index], $pat)
                 {
@@ -1010,6 +1162,111 @@ pub fn _parse(
                 // Create the decoded bytes string
                 ast.bytes(bytes)
             }
+            TokenId::LeftBracket => {
+                // Parse a list
+                let mut nodes = Vec::new();
+                let mut prev_token = TokenId::LeftBracket;
+
+                if matches!(tokens[*token_index].id, TokenId::RightBracket) {
+                    // Handle the empty list case
+                    *token_index += 1;
+                } else {
+                    // Otherwise, parse all the tokens in the list
+
+                    while !matches!(tokens[*token_index].id, TokenId::RightBracket) {
+                        println!("Next token in bracket: {:?}", tokens[*token_index]);
+                        let next_token = tokens[*token_index];
+
+                        if matches!(next_token.id, TokenId::EndOfFile) {
+                            *token_index += 1;
+                            break;
+                        }
+
+                        if matches!(next_token.id, TokenId::Comma) {
+                            if matches!(prev_token, TokenId::LeftBracket | TokenId::Comma) {
+                                    return Err((ParseError::ListCommaBeforeToken, next_token.pos as usize));
+                            }
+
+                            *token_index += 1;
+                            continue;
+                        }
+
+                        let token = _parse(tokens, token_index, input, ast, 20)?;
+                        nodes.push(token);
+
+                        prev_token = next_token.id; 
+                    }
+                    
+                }
+
+                ast.list(nodes)
+            }
+            TokenId::LeftParen => {
+                let next_token = tokens[*token_index];
+                if matches!(next_token.id, TokenId::RightParen) {
+                    ast.hole()
+                } else {
+                    let result =  _parse(tokens, token_index, input, ast, 0)?;
+
+                    if matches!(tokens[*token_index].id, TokenId::RightParen) {
+                        *token_index += 1;
+                    }
+
+                    result
+                }
+            }
+            TokenId::LeftBrace => {
+                let mut prev_token = TokenId::LeftBrace;
+
+                let mut keys = Vec::new();
+                let mut values = Vec::new();
+
+                if matches!(tokens[*token_index].id, TokenId::RightBrace) {
+                    // Nothing to do, return an empty record
+                } else {
+                    while !matches!(tokens[*token_index].id, TokenId::RightBrace) {
+                        println!("Next token in brace: {:?}", tokens[*token_index]);
+                        let next_token = tokens[*token_index];
+
+                        if matches!(next_token.id, TokenId::EndOfFile) {
+                            *token_index += 1;
+                            break;
+                        }
+
+                        if matches!(next_token.id, TokenId::Comma) {
+                            if matches!(prev_token, TokenId::LeftBrace | TokenId::Comma) {
+                                return Err((ParseError::RecordCommaBeforeToken, next_token.pos as usize));
+                            }
+
+                            *token_index += 1;
+                            continue;
+                        }
+
+                        let old_token_index = *token_index;
+                        let token = _parse(tokens, token_index, input, ast, 20)?;
+
+                        match ast.nodes[token] {
+                            Node::Assign { left, right } => {
+                                keys.push(left);
+                                values.push(right);
+                            }
+                            _ => {
+                                dbg!(&ast.nodes[token]);
+                                return Err((ParseError::UnknownToken(tokens[old_token_index].id), old_token_index));
+                            }
+                            
+                        }
+
+                        prev_token = next_token.id; 
+                        *token_index += 1;
+                    }
+                }
+
+                ast.record(keys, values)
+            }
+            TokenId::EndOfFile | TokenId::RightBracket | TokenId::RightBrace | TokenId::RightParen => {
+                panic!("Reached non-leaf first?!");
+            }
             x => return Err((ParseError::UnknownToken(x), start.pos as usize)),
         };
 
@@ -1027,16 +1284,17 @@ pub fn _parse(
             break;
         };
 
-        if matches!(next.id, TokenId::EndOfFile) {
+        if matches!(next.id, TokenId::EndOfFile | TokenId::RightBracket | TokenId::RightBrace | TokenId::RightParen) {
             break;
         }
 
-        if let Some(binary_prescedence) = next.id.get_op_prescedence() {
+        if let Some((binary_precedence, checked)) = next.id.get_op_precedence() {
             let binary_op = next;
             // Is a binary operator
 
             // If the next prescedence is less than the current, return out of the loop
-            if binary_prescedence <= current_precedence {
+            // There are two values given for precedence. 
+            if checked < current_precedence {
                 println!("Found smaller.. bailing");
                 return Ok(left);
             }
@@ -1044,7 +1302,7 @@ pub fn _parse(
             // Increment the token index
             *token_index += 1;
 
-            let right = _parse(tokens, token_index, input, ast, binary_prescedence)?;
+            let right = _parse(tokens, token_index, input, ast, binary_precedence)?;
             match binary_op.id {
                 TokenId::EndOfFile => {
                     println!("Hit EOF");
@@ -1105,17 +1363,39 @@ pub fn _parse(
                 TokenId::OpOr => {
                     left = ast.or(left, right);
                 }
-                x => return Err((ParseError::UnknownOperatorToken(x), binary_op.pos as usize)),
+                TokenId::OpAssign => {
+                    left = ast.assign(left, right);
+                }
+                TokenId::OpFunction => {
+                    left = ast.function(left, right);
+                }
+                TokenId::OpWhere => {
+                    left = ast.where_op(left, right);
+                }
+                TokenId::OpAssert => {
+                    left = ast.assert(left, right);
+                }
+                TokenId::OpHasType => {
+                    left = ast.has_type(left, right);
+                }
+                TokenId::OpPipe => {
+                    left = ast.apply(right, left);
+                }
+                TokenId::OpReversePipe => {
+                    left = ast.apply(left, right);
+                }
+                x => {
+                    return Err((ParseError::UnknownOperatorToken(x), binary_op.pos as usize));
+                }
             }
         } else {
-            println!("Not a bin op: {next:?}");
-
-            if TokenId::OpAccess.get_op_prescedence().unwrap_or(1000) < current_precedence {
+            // Name followed by Name isn't a specific operation in tokens
+            const OPAPPLY_PRECEDENCE: u32 = 1000;
+            if OPAPPLY_PRECEDENCE < current_precedence {
                 break;
             }
 
-            let right = _parse(tokens, token_index, input, ast, current_precedence + 1)?;
-
+            let right = _parse(tokens, token_index, input, ast, OPAPPLY_PRECEDENCE + 2)?;
             left = ast.apply(left, right);
         }
 
@@ -1396,8 +1676,8 @@ mod tests {
         assert_eq!(
             tokens,
             Ok(vec![
-                Token::new(LeftBrace, 0),
-                Token::new(RightBrace, 2),
+                Token::new(LeftBracket, 0),
+                Token::new(RightBracket, 2),
                 Token::new(EndOfFile, 3)
             ])
         );
@@ -1410,11 +1690,11 @@ mod tests {
         assert_eq!(
             tokens,
             Ok(vec![
-                Token::new(LeftBrace, 0),
+                Token::new(LeftBracket, 0),
                 Token::new(Int, 2),
                 Token::new(Comma, 4),
                 Token::new(Int, 6),
-                Token::new(RightBrace, 8),
+                Token::new(RightBracket, 8),
                 Token::new(EndOfFile, 9)
             ])
         );
@@ -1427,11 +1707,11 @@ mod tests {
         assert_eq!(
             tokens,
             Ok(vec![
-                Token::new(LeftBrace, 0),
+                Token::new(LeftBracket, 0),
                 Token::new(Int, 1),
                 Token::new(Comma, 2),
                 Token::new(Int, 3),
-                Token::new(RightBrace, 4),
+                Token::new(RightBracket, 4),
                 Token::new(EndOfFile, 5)
             ])
         );
@@ -1658,8 +1938,8 @@ mod tests {
         assert_eq!(
             tokens,
             Ok(vec![
-                Token::new(LeftBracket, 0),
-                Token::new(RightBracket, 1),
+                Token::new(LeftBrace, 0),
+                Token::new(RightBrace, 1),
                 Token::new(EndOfFile, 2)
             ])
         );
@@ -1672,8 +1952,8 @@ mod tests {
         assert_eq!(
             tokens,
             Ok(vec![
-                Token::new(LeftBracket, 0),
-                Token::new(RightBracket, 3),
+                Token::new(LeftBrace, 0),
+                Token::new(RightBrace, 3),
                 Token::new(EndOfFile, 4)
             ])
         );
@@ -1686,11 +1966,11 @@ mod tests {
         assert_eq!(
             tokens,
             Ok(vec![
-                Token::new(LeftBracket, 0),
+                Token::new(LeftBrace, 0),
                 Token::new(Name, 2),
                 Token::new(OpAssign, 4),
                 Token::new(Int, 6),
-                Token::new(RightBracket, 8),
+                Token::new(RightBrace, 8),
                 Token::new(EndOfFile, 9)
             ])
         );
@@ -1703,7 +1983,7 @@ mod tests {
         assert_eq!(
             tokens,
             Ok(vec![
-                Token::new(LeftBracket, 0),
+                Token::new(LeftBrace, 0),
                 Token::new(Name, 2),
                 Token::new(OpAssign, 4),
                 Token::new(Int, 6),
@@ -1711,7 +1991,7 @@ mod tests {
                 Token::new(Name, 9),
                 Token::new(OpAssign, 11),
                 Token::new(String, 13),
-                Token::new(RightBracket, 17),
+                Token::new(RightBrace, 17),
                 Token::new(EndOfFile, 18)
             ])
         );
@@ -1806,9 +2086,9 @@ mod tests {
         assert_eq!(
             tokens,
             Ok(vec![
-                Token::new(LeftBrace, 0),
+                Token::new(LeftBracket, 0),
                 Token::new(OpSpread, 2),
-                Token::new(RightBrace, 6),
+                Token::new(RightBracket, 6),
                 Token::new(EndOfFile, 7)
             ])
         );
@@ -1821,11 +2101,11 @@ mod tests {
         assert_eq!(
             tokens,
             Ok(vec![
-                Token::new(LeftBrace, 0),
+                Token::new(LeftBracket, 0),
                 Token::new(Int, 2),
                 Token::new(Comma, 4),
                 Token::new(OpSpread, 6),
-                Token::new(RightBrace, 10),
+                Token::new(RightBracket, 10),
                 Token::new(EndOfFile, 11)
             ])
         );
@@ -1838,11 +2118,11 @@ mod tests {
         assert_eq!(
             tokens,
             Ok(vec![
-                Token::new(LeftBrace, 0),
+                Token::new(LeftBracket, 0),
                 Token::new(Int, 1),
                 Token::new(Comma, 2),
                 Token::new(OpSpread, 3),
-                Token::new(RightBrace, 6),
+                Token::new(RightBracket, 6),
                 Token::new(EndOfFile, 7)
             ])
         );
@@ -1855,12 +2135,12 @@ mod tests {
         assert_eq!(
             tokens,
             Ok(vec![
-                Token::new(LeftBrace, 0),
+                Token::new(LeftBracket, 0),
                 Token::new(Int, 1),
                 Token::new(Comma, 2),
                 Token::new(OpSpread, 3),
                 Token::new(Name, 6),
-                Token::new(RightBrace, 10),
+                Token::new(RightBracket, 10),
                 Token::new(EndOfFile, 11)
             ])
         );
@@ -1873,9 +2153,9 @@ mod tests {
         assert_eq!(
             tokens,
             Ok(vec![
-                Token::new(LeftBracket, 0),
+                Token::new(LeftBrace, 0),
                 Token::new(OpSpread, 2),
-                Token::new(RightBracket, 6),
+                Token::new(RightBrace, 6),
                 Token::new(EndOfFile, 7)
             ])
         );
@@ -1888,13 +2168,13 @@ mod tests {
         assert_eq!(
             tokens,
             Ok(vec![
-                Token::new(LeftBracket, 0),
+                Token::new(LeftBrace, 0),
                 Token::new(Name, 2),
                 Token::new(OpAssign, 4),
                 Token::new(Int, 6),
                 Token::new(Comma, 7),
                 Token::new(OpSpread, 9),
-                Token::new(RightBracket, 13),
+                Token::new(RightBrace, 13),
                 Token::new(EndOfFile, 14)
             ])
         );
@@ -1907,13 +2187,13 @@ mod tests {
         assert_eq!(
             tokens,
             Ok(vec![
-                Token::new(LeftBracket, 0),
+                Token::new(LeftBrace, 0),
                 Token::new(Name, 1),
                 Token::new(OpAssign, 2),
                 Token::new(Int, 3),
                 Token::new(Comma, 4),
                 Token::new(OpSpread, 5),
-                Token::new(RightBracket, 8),
+                Token::new(RightBrace, 8),
                 Token::new(EndOfFile, 9)
             ])
         );
@@ -2338,13 +2618,13 @@ mod tests {
                 nodes: vec![
                     Node::Int { data: 1 },
                     Node::Int { data: 2 },
-                    Node::Add {
-                        left: NodeId(0),
-                        right: NodeId(1)
-                    },
                     Node::Int { data: 3 },
                     Node::Add {
-                        left: NodeId(2),
+                        left: NodeId(1),
+                        right: NodeId(2)
+                    },
+                    Node::Add {
+                        left: NodeId(0),
                         right: NodeId(3)
                     }
                 ]
@@ -2463,8 +2743,7 @@ mod tests {
     #[test]
     fn test_parse_binary_list_cons() {
         let input = "a >+ c";
-        let (root, ast) = parse_str(input).unwrap();
-        let _ = ast.dump_dot(root, "/tmp/dump");
+        let (_root, ast) = parse_str(input).unwrap();
 
         assert_eq!(
             ast,
@@ -2481,8 +2760,7 @@ mod tests {
     #[test]
     fn test_parse_binary_list_append() {
         let input = "a +< c";
-        let (root, ast) = parse_str(input).unwrap();
-        let _ = ast.dump_dot(root, "/tmp/dump");
+        let (_root, ast) = parse_str(input).unwrap();
 
         assert_eq!(
             ast,
@@ -2504,8 +2782,7 @@ mod tests {
 
         for op in ops {
             let input = format!("a {op} c");
-            let (root, ast) = parse_str(&input).unwrap();
-            let _ = ast.dump_dot(root, "/tmp/dump");
+            let (_root, ast) = parse_str(&input).unwrap();
 
             let left = NodeId(0);
             let right = NodeId(1);
@@ -2546,15 +2823,527 @@ mod tests {
 
     #[test]
     fn test_parse_empty_list() {
+        let input = "[]";
+        let (_root, ast) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::List { data: vec![] },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_empty_list_with_spaces() {
+        let input = "[ ]";
+        let (_root, ast) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::List { data: vec![] },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_list_with_items() {
+        let input = "[ 1 , 2 ]";
+        let (_root, ast) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Int { data: 1 },
+                    Node::Int { data: 2 },
+                    Node::List { data: vec![ NodeId(0), NodeId(1) ] },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_list_with_items_no_spaces() {
+        let input = "[1*3, 2+4, [a,b]]";
+        let (_root, ast) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Int { data: 1 },
+                    Node::Int { data: 3 },
+                    Node::Mul { left: NodeId(0), right: NodeId(1) },
+                    Node::Int { data: 2 },
+                    Node::Int { data: 4 },
+                    Node::Add { left: NodeId(3), right: NodeId(4) },
+                    Node::Var { data: "a".to_string() },
+                    Node::Var { data: "b".to_string() },
+                    Node::List { data: vec![ NodeId(6), NodeId(7) ] },
+                    Node::List { data: vec![ NodeId(2), NodeId(5), NodeId(8) ] },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_nested_lists() {
+        let input = "[1*3, 2+4, [a,b]]";
+        let (_root, ast) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Int { data: 1 },
+                    Node::Int { data: 3 },
+                    Node::Mul { left: NodeId(0), right: NodeId(1) },
+                    Node::Int { data: 2 },
+                    Node::Int { data: 4 },
+                    Node::Add { left: NodeId(3), right: NodeId(4) },
+                    Node::Var { data: "a".to_string() },
+                    Node::Var { data: "b".to_string() },
+                    Node::List { data: vec![ NodeId(6), NodeId(7) ] },
+                    Node::List { data: vec![ NodeId(2), NodeId(5), NodeId(8) ] },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_pares_list_only_comma() {
+        let input = "[,]";
+        let output= parse_str(input);
+
+        assert!(matches!(
+            output,
+            Err(Error::Parse((ParseError::ListCommaBeforeToken, 1)))
+        ));
+
+    }
+
+    #[test]
+    fn test_pares_list_only_two_commas() {
+        let input = "[,,]";
+        let output= parse_str(input);
+
+        assert!(matches!(
+            output,
+            Err(Error::Parse((ParseError::ListCommaBeforeToken, 1)))
+        ));
+
+    }
+
+    #[test]
+    fn test_parse_assign() {
+        let input = "a = 1";
+        let (_root, ast ) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Var { data: "a".to_string() },
+                    Node::Int { data: 1 },
+                    Node::Assign { left: NodeId(0), right: NodeId(1) },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_function_one_arg() {
+        let input = "a -> a + 1";
+        let (_root, ast ) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Var { data: "a".to_string() },
+                    Node::Var { data: "a".to_string() },
+                    Node::Int { data: 1 },
+                    Node::Add { left: NodeId(1), right: NodeId(2) },
+                    Node::Function { name: NodeId(0), body: NodeId(3) },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_function_two_args() {
+        let input = "a -> b -> a + b";
+        let (_root, ast ) = parse_str(input).unwrap();
+
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Var { data: "a".to_string() },
+                    Node::Var { data: "b".to_string() },
+                    Node::Var { data: "a".to_string() },
+                    Node::Var { data: "b".to_string() },
+                    Node::Add { left: NodeId(2), right: NodeId(3) },
+                    Node::Function { name: NodeId(1), body: NodeId(4) },
+                    Node::Function { name: NodeId(0), body: NodeId(5) },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_assign_function() {
+        let input = "id = x -> x";
+        let (_root, ast ) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Var { data: "id".to_string() },
+                    Node::Var { data: "x".to_string() },
+                    Node::Var { data: "x".to_string() },
+                    Node::Function { name: NodeId(1), body: NodeId(2) },
+                    Node::Assign{ left: NodeId(0), right: NodeId(3) },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_function_application_one_arg() {
+        let input = "f a";
+        let (_root, ast ) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Var { data: "f".to_string() },
+                    Node::Var { data: "a".to_string() },
+                    Node::Apply { left: NodeId(0), right: NodeId(1) },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_function_application_two_args() {
+        let input = "f a b";
+        let (_root, ast ) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Var { data: "f".to_string() },
+                    Node::Var { data: "a".to_string() },
+                    Node::Apply { left: NodeId(0), right: NodeId(1) },
+                    Node::Var { data: "b".to_string() },
+                    Node::Apply { left: NodeId(2), right: NodeId(3) },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_where() {
+        let input = "a . b";
+        let (_root, ast ) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Var { data: "a".to_string() },
+                    Node::Var { data: "b".to_string() },
+                    Node::Where { left: NodeId(0), right: NodeId(1) },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_nested_where() {
+        let input = "a . b . c";
+        let (_root, ast ) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Var { data: "a".to_string() },
+                    Node::Var { data: "b".to_string() },
+                    Node::Where { left: NodeId(0), right: NodeId(1) },
+                    Node::Var { data: "c".to_string() },
+                    Node::Where { left: NodeId(2), right: NodeId(3) },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_assert() {
+        let input = "a ? b";
+        let (_root, ast ) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Var { data: "a".to_string() },
+                    Node::Var { data: "b".to_string() },
+                    Node::Assert { left: NodeId(0), right: NodeId(1) },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_nested_assert() {
+        let input = "a ? b ? c";
+        let (_root, ast ) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Var { data: "a".to_string() },
+                    Node::Var { data: "b".to_string() },
+                    Node::Assert { left: NodeId(0), right: NodeId(1) },
+                    Node::Var { data: "c".to_string() },
+                    Node::Assert { left: NodeId(2), right: NodeId(3) },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_hastype() {
+        let input = "a : b";
+        let (_root, ast ) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Var { data: "a".to_string() },
+                    Node::Var { data: "b".to_string() },
+                    Node::HasType { left: NodeId(0), right: NodeId(1) },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_hole() {
+        let input = "()";
+        let (_root, ast ) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Hole,
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_parenthesized_expression() {
+        let input = "(1+2)";
+        let (_root, ast ) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Int { data: 1 },
+                    Node::Int { data: 2 },
+                    Node::Add{ left: NodeId(0), right: NodeId(1) },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_parenthesized_expression_add_mul() {
+        let input = "(1+2)*3";
+        let (_root, ast ) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Int { data: 1 },
+                    Node::Int { data: 2 },
+                    Node::Add { left: NodeId(0), right: NodeId(1) },
+                    Node::Int { data: 3 },
+                    Node::Mul { left: NodeId(2), right: NodeId(3) },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_pipe() {
+        let input = "1 |> f";
+        let (_root, ast ) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Int { data: 1 },
+                    Node::Var { data: "f".to_string() },
+                    Node::Apply { left: NodeId(1), right: NodeId(0) },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_nested_pipe() {
+        let input = "1 |> f |> g";
+        let (_root, ast ) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Int { data: 1 },
+                    Node::Var { data: "f".to_string() },
+                    Node::Apply { left: NodeId(1), right: NodeId(0) },
+                    Node::Var { data: "g".to_string() },
+                    Node::Apply { left: NodeId(3), right: NodeId(2) },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_reverse_pipe() {
+        let input = "f <| 1";
+        let (_root, ast ) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Var { data: "f".to_string() },
+                    Node::Int { data: 1 },
+                    Node::Apply { left: NodeId(0), right: NodeId(1) },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_nested_reverse_pipe() {
+        let input = "g <| f <| 1";
+        let (_root, ast ) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Var { data: "g".to_string() },
+                    Node::Var { data: "f".to_string() },
+                    Node::Int { data: 1 },
+                    Node::Apply { left: NodeId(1), right: NodeId(2) },
+                    Node::Apply { left: NodeId(0), right: NodeId(3) },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_empty_record() {
         let input = "{}";
-        let (root, ast) = parse_str(input).unwrap();
+        let (_root, ast ) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Record { keys: Vec::new(), values: Vec::new() },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_empty_single_field() {
+        let input = "{ a=4 }";
+        let (_root, ast ) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Var { data: "a".to_string() },
+                    Node::Int { data: 4 },
+                    Node::Assign { left: NodeId(0), right: NodeId(1) },
+                    Node::Record { 
+                        keys: vec![NodeId(0)], 
+                        values: vec![NodeId(1)]
+                    },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_empty_with_expression() {
+        let input = "{ a=1+2 }";
+        let (_root, ast ) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Var { data: "a".to_string() },
+                    Node::Int { data: 1 },
+                    Node::Int { data: 2 },
+                    Node::Add { left: NodeId(1), right: NodeId(2) },
+                    Node::Assign { left: NodeId(0), right: NodeId(3) },
+                    Node::Record { 
+                        keys: vec![NodeId(0)], 
+                        values: vec![NodeId(3)]
+                    },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_empty_multiple_fields() {
+        let input = "{ a=4, b=z }";
+        let (root, ast ) = parse_str(input).unwrap();
         let _ = ast.dump_dot(root, "/tmp/dump");
 
         assert_eq!(
             ast,
             SyntaxTree {
                 nodes: vec![
-                    Node::List { data: Vec::new() },
+                    Node::Var { data: "a".to_string() },
+                    Node::Int { data: 4 },
+                    Node::Assign { left: NodeId(0), right: NodeId(1) },
+                    Node::Var { data: "b".to_string() },
+                    Node::Var { data: "z".to_string() },
+                    Node::Assign { left: NodeId(3), right: NodeId(4) },
+                    Node::Record { 
+                        keys: vec![NodeId(0), NodeId(3)], 
+                        values: vec![NodeId(1), NodeId(4)]
+                    },
                 ]
             }
         );
