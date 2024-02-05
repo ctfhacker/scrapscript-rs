@@ -209,7 +209,9 @@ impl TokenId {
             OpMatchCase => Some((42, 42)),
             OpHasType => Some((41, 41)),
             OpAssign => Some((40, 40)),
-            OpRightEval | OpWhere | OpAssert => Some((30, 29)),
+            OpWhere => Some((30, 29)),
+            OpAssert => Some((30, 29)),
+            OpRightEval => Some((29, 29)),
             Comma => Some((10, 10)),
             OpSpread => Some((0, 0)),
             x => {
@@ -240,6 +242,9 @@ pub enum Node {
 
     /// A vec of nodes
     List { data: Vec<NodeId> },
+
+    /// A set of match cases
+    MatchFunction { data: Vec<NodeId> },
 
     /// A record of nodes
     Record { keys: Vec<NodeId>, values: Vec<NodeId> },
@@ -287,10 +292,10 @@ pub enum Node {
     Access { left: NodeId, right: NodeId },
 
     /// An bitwise and operation between two nodes
-    BoolAnd { left: NodeId, right: NodeId },
+    And { left: NodeId, right: NodeId },
 
     /// An bitwise or operation between two nodes
-    BoolOr { left: NodeId, right: NodeId },
+    Or { left: NodeId, right: NodeId },
 
     /// An apply operation between two nodes
     Apply { left: NodeId, right: NodeId },
@@ -313,9 +318,20 @@ pub enum Node {
     /// A hastype operation
     HasType { left: NodeId, right: NodeId },
 
+    /// A right eval operation
+    RightEval { left: NodeId, right: NodeId },
+
     /// A function operation
     Function { name: NodeId, body: NodeId },
 
+    /// A match case
+    MatchCase { left: NodeId, right: NodeId },
+
+    /// A compose case
+    Compose { left: NodeId, right: NodeId },
+
+    /// A spread node
+    Spread { name: Option<String> },
 }
 
 impl Node {
@@ -346,8 +362,8 @@ impl Node {
             Node::LessEqual { .. } => "<=".to_string(),
             Node::Equal { .. } => "==".to_string(),
             Node::NotEqual { .. } => "/=".to_string(),
-            Node::BoolAnd { .. } => "&&".to_string(),
-            Node::BoolOr { .. } => "||".to_string(),
+            Node::And { .. } => "&& (AND)".to_string(),
+            Node::Or { .. } => "|| (OR)".to_string(),
             Node::Access { .. } => "@ (ACCESS) ".to_string(),
             Node::Apply { .. } => "APPLY".to_string(),
             Node::ListAppend { .. } => "+< (LIST_APPEND)".to_string(),
@@ -358,7 +374,18 @@ impl Node {
             Node::Where { .. } => ". (WHERE)".to_string(),
             Node::Assert { .. } => "? (ASSERT)".to_string(),
             Node::HasType { .. } => ": (HAS_TYPE)".to_string(),
+            Node::RightEval { .. } => "! (RIGHT_EVAL)".to_string(),
+            Node::MatchCase { .. } => "case".to_string(),
+            Node::MatchFunction{ .. } => "MATCH_FUNCTION".to_string(),
+            Node::Compose { .. } => "<< (COMPOSE)".to_string(),
             Node::Hole => "()".to_string(),
+            Node::Spread { name } => {
+                let mut label = "...".to_string();
+                if let Some(name) = name {
+                    label.push_str(&name);
+                }
+                label
+            }
         }
     }
 }
@@ -415,16 +442,29 @@ pub enum ParseError {
     UnknownToken(TokenId),
     UnknownOperatorToken(TokenId),
     NoTokensGiven,
+    UnexpectedEndOfFile,
+
+    Int(std::num::ParseIntError),
+    Float(std::num::ParseFloatError),
+    Base85(base85::Error),
+    Base64(base64::DecodeError),
 
     /// Comma in list found before another valid token.
     /// Ex: [,] or [,,]
     ListCommaBeforeToken,
     RecordCommaBeforeToken,
 
-    Int(std::num::ParseIntError),
-    Float(std::num::ParseFloatError),
-    Base85(base85::Error),
-    Base64(base64::DecodeError),
+    /// Left side of an assignment was not a variable
+    NonVariableInAssignment,
+
+    /// The expression in the record was not as assign operation
+    NonAssignmentInRecord(TokenId),
+
+    /// The expression in the record was not a function operation
+    NonFunctionInMatch(TokenId),
+
+    /// The name of a spread must be a name
+    NonVariableSpreadNameFound
 }
 
 macro_rules! impl_from_err {
@@ -517,8 +557,8 @@ impl SyntaxTree {
     impl_left_right_node!(less_equal, LessEqual);
     impl_left_right_node!(equal, Equal);
     impl_left_right_node!(not_equal, NotEqual);
-    impl_left_right_node!(and, BoolAnd);
-    impl_left_right_node!(or, BoolOr);
+    impl_left_right_node!(and, And);
+    impl_left_right_node!(or, Or);
     impl_left_right_node!(access, Access);
     impl_left_right_node!(apply, Apply);
     impl_left_right_node!(list_append, ListAppend);
@@ -528,11 +568,23 @@ impl SyntaxTree {
     impl_left_right_node!(where_op, Where);
     impl_left_right_node!(assert, Assert);
     impl_left_right_node!(has_type, HasType);
+    impl_left_right_node!(right_eval, RightEval);
+    impl_left_right_node!(match_case, MatchCase);
+    impl_left_right_node!(compose, Compose);
 
     pub fn hole(&mut self) -> NodeId {
         let node_index = self.nodes.len();
 
         let node = Node::Hole;
+        self.nodes.push(node);
+
+        NodeId(node_index)
+    }
+
+    pub fn spread(&mut self, name: Option<String>) -> NodeId {
+        let node_index = self.nodes.len();
+
+        let node = Node::Spread { name };
         self.nodes.push(node);
 
         NodeId(node_index)
@@ -558,6 +610,15 @@ impl SyntaxTree {
         NodeId(node_index)
     }
 
+    pub fn match_function(&mut self, data: Vec<NodeId>) -> NodeId {
+        let node_index = self.nodes.len();
+
+        let node = Node::MatchFunction { data };
+        self.nodes.push(node);
+
+        NodeId(node_index)
+    }
+
     /// Dump a .dot of this syntax tree
     ///
     /// # Errors
@@ -578,7 +639,7 @@ impl SyntaxTree {
             let curr_node = &self.nodes[node_id];
 
             // List nodes are special
-            if !matches!(curr_node, Node::List {.. } | Node::Record { .. }) {
+            if !matches!(curr_node, Node::List {.. } | Node::Record { .. } | Node::MatchFunction { .. }) {
                 dot.push_str(&format!("{node_id} [ label = {:?} ];\n", curr_node.label()));
             }
 
@@ -599,12 +660,15 @@ impl SyntaxTree {
                 | Node::LessThan { left, right }
                 | Node::Equal { left, right }
                 | Node::NotEqual { left, right }
-                | Node::BoolAnd { left, right }
-                | Node::BoolOr { left, right }
+                | Node::And { left, right }
+                | Node::Or { left, right }
                 | Node::Assign { left, right }
                 | Node::Where { left, right }
                 | Node::Assert { left, right }
                 | Node::HasType { left, right }
+                | Node::RightEval { left, right }
+                | Node::MatchCase{ left, right }
+                | Node::Compose { left, right }
                 | Node::Access { left, right } => {
                     queue.push(*left);
                     queue.push(*right);
@@ -644,9 +708,38 @@ impl SyntaxTree {
                         dot.push_str(&format!("{node_id}:f{i} -> {child_node_id};\n"));
                     }
                 }
+                Node::MatchFunction { data} => {
+                    let label = data
+                        .iter()
+                        .enumerate().map(|(i, value)| {
+                            let Node::MatchCase { left, .. } = self.nodes[*value] else {
+                                panic!("Non-matchcase in match function");
+                            };
+                            let case = &self.nodes[left];
+
+                            format!("<f{i}> case {}", case.label())
+                        }).collect::<Vec<_>>().join(" | ");
+
+                    dot.push_str(&format!("node [shape=record]; {node_id} [ label = \"{label}\" ];\n"));
+
+                    for (i, child_node_id) in data.iter().enumerate() {
+                        let Node::MatchCase { right, .. } = self.nodes[*child_node_id] else {
+                            panic!("Non-matchcase in match function 22");
+                        };
+
+                        queue.push(right);
+                        dot.push_str(&format!("{node_id}:f{i} -> {right}\n"));
+                    }
+                }
 
 
-                Node::Int { .. } | Node::Float { .. } | Node::Var { .. } | Node::Bytes { .. } | Node::Hole => {
+                Node::Int { .. } 
+                | Node::Float { .. } 
+                | Node::Var { .. } 
+                | Node::Bytes { .. } 
+                | Node::Hole 
+                | Node::Spread  { .. }
+                => {
                     // This is a leaf node.. nothing else to parse
                 }
             }
@@ -1078,8 +1171,6 @@ pub fn _parse(
         return Err((ParseError::NoTokensGiven, 0));
     }
 
-    dbg!(tokens[*token_index]);
-
     let parse_leaf = |ast: &mut SyntaxTree,
                       token_index: &mut usize|
      -> Result<NodeId, (ParseError, usize)> {
@@ -1087,6 +1178,10 @@ pub fn _parse(
 
         let start = tokens[start_token_pos];
         *token_index += 1;
+
+        if *token_index >= tokens.len() {
+            return Err((ParseError::UnexpectedEndOfFile, input.len()));
+        }
 
         let input_index = start.pos as usize;
         let mut end_input_index = tokens[*token_index].pos as usize - 1;
@@ -1105,6 +1200,27 @@ pub fn _parse(
 
         // Parse the next leaf token
         let leaf = match start.id {
+            TokenId::OpSpread => {
+                let next_token = tokens[*token_index];
+                let mut spread_name = None;
+                match next_token.id {
+                    TokenId::RightBracket => {
+                        // Spread name will remain nameless
+                    }
+                    TokenId::Name => {
+                        let input_index = next_token.pos as usize;
+                        let end_input_index = tokens[*token_index + 1].pos as usize - 1;
+
+                        continue_while!(b'a'..=b'z' | b'A'..=b'Z' | b'$' | b'\'' | b'_' | b'0'..=b'9');
+                        spread_name = Some(input[input_index..=end_input_index].to_string());
+
+                        *token_index += 1;
+                    }
+                    x => return Err((ParseError::UnknownToken(x), 0)),
+                }
+
+                ast.spread(spread_name)
+            }
             TokenId::Int => {
                 continue_while!(b'0'..=b'9');
 
@@ -1252,7 +1368,7 @@ pub fn _parse(
                             }
                             _ => {
                                 dbg!(&ast.nodes[token]);
-                                return Err((ParseError::UnknownToken(tokens[old_token_index].id), old_token_index));
+                                return Err((ParseError::NonAssignmentInRecord(tokens[old_token_index].id), next_token.pos as usize));
                             }
                             
                         }
@@ -1266,6 +1382,35 @@ pub fn _parse(
             }
             TokenId::EndOfFile | TokenId::RightBracket | TokenId::RightBrace | TokenId::RightParen => {
                 panic!("Reached non-leaf first?!");
+            }
+            TokenId::OpMatchCase => {
+                let mut matches = Vec::new();
+
+                *token_index -= 1;
+
+                while matches!(tokens[*token_index].id, TokenId::OpMatchCase) {
+                    *token_index += 1;
+
+                    let old_token_index = *token_index;
+                    let next_token = tokens[*token_index];
+                    let case= _parse(tokens, token_index, input, ast, 0)?;
+
+                    dbg!(&ast.nodes[case]);
+
+                    match ast.nodes[case] {
+                        Node::Function { name, body } => {
+                            // Replace the Function with a MatchCase node
+                            ast.nodes[case] = Node::MatchCase { left: name, right: body };
+                            let result= matches.push(case);
+                            result
+                        }
+                        _ => {
+                            return Err((ParseError::NonFunctionInMatch(tokens[old_token_index].id), next_token.pos as usize));
+                        }
+                    }
+                }
+
+                ast.match_function(matches)
             }
             x => return Err((ParseError::UnknownToken(x), start.pos as usize)),
         };
@@ -1284,7 +1429,8 @@ pub fn _parse(
             break;
         };
 
-        if matches!(next.id, TokenId::EndOfFile | TokenId::RightBracket | TokenId::RightBrace | TokenId::RightParen) {
+        if matches!(next.id, 
+            TokenId::EndOfFile | TokenId::RightBracket | TokenId::RightBrace | TokenId::RightParen | TokenId::OpMatchCase) {
             break;
         }
 
@@ -1364,6 +1510,18 @@ pub fn _parse(
                     left = ast.or(left, right);
                 }
                 TokenId::OpAssign => {
+                    let left_node = &ast.nodes[left];
+
+                    // Only allow variables on left side of assignments
+                    if !matches!(left_node, Node::Var { .. }) {
+                        if *token_index < 3 {
+                            panic!("Less than 3 tokens before hitting assign? {}", *token_index);
+                        }
+
+                        let prev_token = tokens[*token_index - 3];
+                        return Err((ParseError::NonVariableInAssignment, prev_token.pos as usize));
+                    }
+
                     left = ast.assign(left, right);
                 }
                 TokenId::OpFunction => {
@@ -1383,6 +1541,15 @@ pub fn _parse(
                 }
                 TokenId::OpReversePipe => {
                     left = ast.apply(left, right);
+                }
+                TokenId::OpRightEval => {
+                    left = ast.right_eval(left, right);
+                }
+                TokenId::OpCompose => {
+                    left = ast.compose(left, right);
+                }
+                TokenId::OpComposeReverse => {
+                    left = ast.compose(right, left);
                 }
                 x => {
                     return Err((ParseError::UnknownOperatorToken(x), binary_op.pos as usize));
@@ -2800,8 +2967,8 @@ mod tests {
                 ">" => Node::GreaterThan { left, right },
                 "<=" => Node::LessEqual { left, right }, 
                 ">=" => Node::GreaterEqual { left, right },
-                "&&" => Node::BoolAnd { left, right }, 
-                "||" => Node::BoolOr { left, right }, 
+                "&&" => Node::And { left, right }, 
+                "||" => Node::Or { left, right }, 
                 "++" => Node::StrConcat { left, right }, 
                 ">+" => Node::ListCons { left, right }, 
                 "+<" => Node::ListAppend { left, right },
@@ -3327,8 +3494,7 @@ mod tests {
     #[test]
     fn test_parse_empty_multiple_fields() {
         let input = "{ a=4, b=z }";
-        let (root, ast ) = parse_str(input).unwrap();
-        let _ = ast.dump_dot(root, "/tmp/dump");
+        let (_root, ast ) = parse_str(input).unwrap();
 
         assert_eq!(
             ast,
@@ -3344,6 +3510,251 @@ mod tests {
                         keys: vec![NodeId(0), NodeId(3)], 
                         values: vec![NodeId(1), NodeId(4)]
                     },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_non_variable_in_assignment_raises_parse_error() {
+        let input = "3=4";
+        let output = parse_str(input);
+
+        dbg!(&output);
+
+        assert!(matches!(
+            output,
+            Err(Error::Parse((ParseError::NonVariableInAssignment, 0)))
+        ));
+
+    }
+
+    #[test]
+    fn test_non_assign_in_record_constructor_raises_parse_error() {
+        let input = "{ 1,2 }";
+        let output = parse_str(input);
+
+        dbg!(&output);
+
+        assert!(matches!(
+            output,
+            Err(Error::Parse((ParseError::NonAssignmentInRecord { .. }, 2)))
+        ));
+
+    }
+
+    #[test]
+    fn test_parse_right_eval() {
+        let input = "a!b";
+        let (_root, ast ) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Var { data: "a".to_string() },
+                    Node::Var { data: "b".to_string() },
+                    Node::RightEval{ left: NodeId(0), right: NodeId(1) },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_right_eval_with_defs() {
+        let input = "a ! b . c";
+        let (_root, ast ) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Var { data: "a".to_string() },
+                    Node::Var { data: "b".to_string() },
+                    Node::Var { data: "c".to_string() },
+                    Node::Where{ left: NodeId(1), right: NodeId(2) },
+                    Node::RightEval{ left: NodeId(0), right: NodeId(3) },
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_match_no_cases_raises_parse_error() {
+        let input = "|";
+        let output= parse_str(input);
+
+        assert!(matches!(
+            output,
+            Err(Error::Parse((ParseError::UnexpectedEndOfFile, 1)))
+        ));
+    }
+
+    #[test]
+    fn test_parse_match_one_case() {
+        let input = "| 1 -> 2";
+        let (_root, ast ) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Int { data: 1 },
+                    Node::Int { data: 2 },
+                    Node::MatchCase { left: NodeId(0), right: NodeId(1) },
+                    Node::MatchFunction { data: vec![NodeId(2)]},
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_match_three_cases() {
+        let input = r#"
+            | 1 -> a
+            | 2 -> b
+            | 3 -> c
+        "#;
+        let (_root, ast ) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Int { data: 1 },
+                    Node::Var { data: "a".to_string() },
+                    Node::MatchCase { left: NodeId(0), right: NodeId(1) },
+                    Node::Int { data: 2 },
+                    Node::Var { data: "b".to_string() },
+                    Node::MatchCase { left: NodeId(3), right: NodeId(4) },
+                    Node::Int { data: 3 },
+                    Node::Var { data: "c".to_string() },
+                    Node::MatchCase { left: NodeId(6), right: NodeId(7) },
+                    Node::MatchFunction { data: vec![
+                        NodeId(2),
+                        NodeId(5),
+                        NodeId(8),
+                    ]},
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_compose() {
+        let input = r#"
+            f >> g
+        "#;
+        let (_root, ast ) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Var { data: "f".to_string() },
+                    Node::Var { data: "g".to_string() },
+                    Node::Compose { left: NodeId(0), right: NodeId(1) }
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_compose_reverse() {
+        let input = r#"
+            f << g
+        "#;
+        let (_root, ast ) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Var { data: "f".to_string() },
+                    Node::Var { data: "g".to_string() },
+                    Node::Compose { left: NodeId(1), right: NodeId(0) }
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_double_compose() {
+        let input = r#"
+            f << g << h
+        "#;
+        let (_root, ast ) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Var { data: "f".to_string() },
+                    Node::Var { data: "g".to_string() },
+                    Node::Var { data: "h".to_string() },
+                    Node::Compose { left: NodeId(2), right: NodeId(1) },
+                    Node::Compose { left: NodeId(3), right: NodeId(0) }
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_and_tighter_than_or() {
+        let input = r#"
+            x || y && z
+        "#;
+        let (_root, ast ) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Var { data: "x".to_string() },
+                    Node::Var { data: "y".to_string() },
+                    Node::Var { data: "z".to_string() },
+                    Node::And { left: NodeId(1), right: NodeId(2) },
+                    Node::Or { left: NodeId(0), right: NodeId(3) }
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_list_spread() {
+        let input = r#"
+            [1, ... ]
+        "#;
+        let (_root, ast ) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Int { data: 1 },
+                    Node::Spread { name: None },
+                    Node::List { data: vec![ NodeId(0), NodeId(1) ]}
+                ]
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_list_with_non_name_expr_after_spread_raises_parse_error() {
+        let input = r#"
+            [1, ...rest]
+        "#;
+
+        let (root, ast) = parse_str(input).unwrap();
+        let _ = ast.dump_dot(root, "/tmp/dump");
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Int { data: 1 },
+                    Node::Spread { name: Some("rest".to_string()) },
+                    Node::List { data: vec![ NodeId(0), NodeId(1) ]}
                 ]
             }
         );
