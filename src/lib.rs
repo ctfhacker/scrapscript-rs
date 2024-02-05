@@ -64,10 +64,10 @@ pub enum TokenId {
     OpGreaterEqual,
 
     /// Operator &&
-    OpBoolAnd,
+    OpAnd,
 
     /// Operator ||
-    OpBoolOr,
+    OpOr,
 
     /// Operator ++
     OpStrConcat,
@@ -121,26 +121,28 @@ pub enum TokenId {
 }
 
 impl TryFrom<&str> for TokenId {
-    pub fn from(&self, input: &str) -> Option<u32> {
+    type Error = TokenError;
+
+    fn try_from(input: &str) -> Result<TokenId, Self::Error> {
         match input {
-            "+" => Some(TokenId::OpAdd),
-            "-" => Some(TokenId::OpSub),
-            "*" => Some(TokenId::OpMul),
-            "/" => Some(TokenId::OpDiv),
-            "^" => Some(TokenId::OpExp),
-            "%" => Some(TokenId::OpMod),
-            "==" => Some(TokenId::OpEqual),
-            "/=" => Some(TokenId::OpNotEqual),
-            "<" => Some(TokenId::OpLess),
-            ">" => Some(TokenId::OpGreater),
-            "<=" => Some(TokenId::OpLessEqual),
-            ">=" => Some(TokenId::OpGreaterEqual),
-            "&&" => Some(TokenId::OpBoolAnd),
-            "||" => Some(TokenId::OpBoolOr),
-            "++" => Some(TokenId::OpListCons),
-            ">+" => Some(TokenId::OpAdd),
-            "+<" => Some(TokenId::OpAdd),
-            _ => None
+            "+" => Ok(TokenId::OpAdd),
+            "-" => Ok(TokenId::OpSub),
+            "*" => Ok(TokenId::OpMul),
+            "/" => Ok(TokenId::OpDiv),
+            "^" => Ok(TokenId::OpExp),
+            "%" => Ok(TokenId::OpMod),
+            "==" => Ok(TokenId::OpEqual),
+            "/=" => Ok(TokenId::OpNotEqual),
+            "<" => Ok(TokenId::OpLess),
+            ">" => Ok(TokenId::OpGreater),
+            "<=" => Ok(TokenId::OpLessEqual),
+            ">=" => Ok(TokenId::OpGreaterEqual),
+            "&&" => Ok(TokenId::OpAnd),
+            "||" => Ok(TokenId::OpOr),
+            "++" => Ok(TokenId::OpStrConcat),
+            ">+" => Ok(TokenId::OpListCons),
+            "+<" => Ok(TokenId::OpListAppend),
+            x => Err(TokenError::UnknownCharacter(x.chars().nth(0).unwrap()))
         }
     }
 }
@@ -160,8 +162,8 @@ impl TokenId {
             OpSub | OpAdd => Some(110),
             OpListCons | OpListAppend | OpStrConcat => Some(100),
             OpEqual | OpNotEqual | OpLess | OpGreater | OpLessEqual | OpGreaterEqual => Some(90),
-            OpBoolAnd => Some(80),
-            OpBoolOr => Some(70),
+            OpAnd => Some(80),
+            OpOr => Some(70),
             OpPipe | OpReversePipe => Some(60),
             OpFunction => Some(50),
             OpMatchCase => Some(42),
@@ -193,6 +195,9 @@ pub enum Node {
     /// A vec of bytes
     Bytes { data: Vec<u8> },
 
+    /// A vec of things?
+    List { data: Vec<Node> },
+
     /// A exponentiation operation
     Exp { left: NodeId, right: NodeId },
 
@@ -205,11 +210,38 @@ pub enum Node {
     /// A multiplication operation between two nodes
     Mul { left: NodeId, right: NodeId },
 
+    /// A divide operation between two nodes
+    Div { left: NodeId, right: NodeId },
+
+    /// A modulo operation between two nodes
+    Mod { left: NodeId, right: NodeId },
+
     /// A greater than operation between two nodes
     GreaterThan { left: NodeId, right: NodeId },
 
+    /// A greater than or equal operation between two nodes
+    GreaterEqual { left: NodeId, right: NodeId },
+
+    /// A less than operation between two nodes
+    LessThan { left: NodeId, right: NodeId },
+
+    /// A less than or equal than operation between two nodes
+    LessEqual { left: NodeId, right: NodeId },
+
+    /// An equal operation between two nodes
+    Equal { left: NodeId, right: NodeId },
+
+    /// A not equal operation between two nodes
+    NotEqual { left: NodeId, right: NodeId },
+
     /// An access operation between two nodes
     Access { left: NodeId, right: NodeId },
+
+    /// An bitwise and operation between two nodes
+    BoolAnd { left: NodeId, right: NodeId },
+
+    /// An bitwise or operation between two nodes
+    BoolOr { left: NodeId, right: NodeId },
 
     /// An apply operation between two nodes
     Apply { left: NodeId, right: NodeId },
@@ -230,6 +262,9 @@ impl Node {
         match self {
             Node::Int { data } => format!("{data:#x} ({data})"),
             Node::Float { data } => format!("{data:.4}"),
+            Node::List { data } => {
+                format!("{:?}", data.iter().map(Node::label).collect::<Vec<_>>())
+            }
             Node::Var { data } => data.to_string(),
             Node::Bytes { data } => {
                 format!("{:?}", data.iter().map(|x| *x as char).collect::<Vec<_>>())
@@ -238,7 +273,16 @@ impl Node {
             Node::Add { .. } => "+".to_string(),
             Node::Mul { .. } => "*".to_string(),
             Node::Exp { .. } => "^".to_string(),
+            Node::Div { .. } => "/".to_string(),
+            Node::Mod { .. } => "%".to_string(),
             Node::GreaterThan { .. } => ">".to_string(),
+            Node::GreaterEqual { .. } => ">=".to_string(),
+            Node::LessThan { .. } => "<".to_string(),
+            Node::LessEqual { .. } => "<=".to_string(),
+            Node::Equal { .. } => "==".to_string(),
+            Node::NotEqual { .. } => "/=".to_string(),
+            Node::BoolAnd { .. } => "&&".to_string(),
+            Node::BoolOr { .. } => "||".to_string(),
             Node::Access { .. } => "@ (ACCESS) ".to_string(),
             Node::Apply { .. } => "APPLY".to_string(),
             Node::ListAppend { .. } => "+< (LIST_APPEND)".to_string(),
@@ -386,10 +430,19 @@ impl SyntaxTree {
     impl_left_right_node!(sub, Sub);
     impl_left_right_node!(add, Add);
     impl_left_right_node!(mul, Mul);
+    impl_left_right_node!(exp, Exp);
+    impl_left_right_node!(div, Div);
+    impl_left_right_node!(modulo, Mod);
     impl_left_right_node!(greater_than, GreaterThan);
+    impl_left_right_node!(greater_equal, GreaterEqual);
+    impl_left_right_node!(less_than, LessThan);
+    impl_left_right_node!(less_equal, LessEqual);
+    impl_left_right_node!(equal, Equal);
+    impl_left_right_node!(not_equal, NotEqual);
+    impl_left_right_node!(and, BoolAnd);
+    impl_left_right_node!(or, BoolOr);
     impl_left_right_node!(access, Access);
     impl_left_right_node!(apply, Apply);
-    impl_left_right_node!(exp, Exp);
     impl_left_right_node!(list_append, ListAppend);
     impl_left_right_node!(str_concat, StrConcat);
     impl_left_right_node!(list_cons, ListCons);
@@ -419,12 +472,21 @@ impl SyntaxTree {
                 Node::Sub { left, right }
                 | Node::Add { left, right }
                 | Node::Mul { left, right }
-                | Node::GreaterThan { left, right }
                 | Node::Exp { left, right }
+                | Node::Div { left, right }
+                | Node::Mod { left, right }
                 | Node::Apply { left, right }
                 | Node::ListAppend { left, right }
                 | Node::StrConcat { left, right }
                 | Node::ListCons { left, right }
+                | Node::GreaterThan { left, right }
+                | Node::GreaterEqual{ left, right }
+                | Node::LessEqual { left, right }
+                | Node::LessThan { left, right }
+                | Node::Equal { left, right }
+                | Node::NotEqual { left, right }
+                | Node::BoolAnd { left, right }
+                | Node::BoolOr { left, right }
                 | Node::Access { left, right } => {
                     queue.push(*left);
                     queue.push(*right);
@@ -434,15 +496,13 @@ impl SyntaxTree {
                 }
 
 
-                Node::Int { .. } | Node::Float { .. } | Node::Var { .. } | Node::Bytes { .. } => {
+                Node::Int { .. } | Node::Float { .. } | Node::Var { .. } | Node::Bytes { .. } | Node::List { .. } => {
                     // This is a leaf node.. nothing else to parse
                 }
             }
         }
 
         dot.push('}');
-
-        println!("{dot}");
 
         std::fs::write(out_name, dot)
     }
@@ -700,10 +760,10 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
                 set_token!(OpGreaterEqual, 2);
             }
             [b'&', b'&', ..] => {
-                set_token!(OpBoolAnd, 2);
+                set_token!(OpAnd, 2);
             }
             [b'|', b'|', ..] => {
-                set_token!(OpBoolOr, 2);
+                set_token!(OpOr, 2);
             }
             [b'+', b'+', ..] => {
                 set_token!(OpStrConcat, 2);
@@ -881,8 +941,6 @@ pub fn _parse(
         let input_index = start.pos as usize;
         let mut end_input_index = tokens[*token_index].pos as usize - 1;
 
-        dbg!(start.id);
-
         macro_rules! continue_while {
             ($pat:pat) => {
                 // Skip over all whitespace. Reset the current token when hitting whitespace.
@@ -959,13 +1017,8 @@ pub fn _parse(
     };
 
     let mut left = parse_leaf(ast, token_index)?;
-    println!("Left: {:?}", ast.nodes[left]);
 
-    //
     loop {
-        println!("{input}");
-        println!("{}^", " ".repeat(*token_index));
-
         // Check if the left was modified
         let original = left;
 
@@ -1001,39 +1054,57 @@ pub fn _parse(
                 TokenId::OpAdd => {
                     left = ast.add(left, right);
                 }
-
                 TokenId::OpSub => {
                     left = ast.sub(left, right);
                 }
-
                 TokenId::OpMul => {
                     left = ast.mul(left, right);
                 }
-
                 TokenId::OpExp => {
                     left = ast.exp(left, right);
                 }
-
                 TokenId::OpGreater => {
                     left = ast.greater_than(left, right);
                 }
-
+                TokenId::OpGreaterEqual => {
+                    left = ast.greater_equal(left, right);
+                }
+                TokenId::OpLess => {
+                    left = ast.less_than(left, right);
+                }
+                TokenId::OpLessEqual => {
+                    left = ast.less_equal(left, right);
+                }
                 TokenId::OpAccess => {
                     left = ast.access(left, right);
                 }
-
                 TokenId::OpListAppend => {
                     left = ast.list_append(left, right);
                 }
-
                 TokenId::OpStrConcat => {
                     left = ast.str_concat(left, right);
                 }
-
                 TokenId::OpListCons => {
                     left = ast.list_cons(left, right);
                 }
-
+                TokenId::OpDiv => {
+                    left = ast.div(left, right);
+                }
+                TokenId::OpMod => {
+                    left = ast.modulo(left, right);
+                }
+                TokenId::OpEqual => {
+                    left = ast.equal(left, right);
+                }
+                TokenId::OpNotEqual => {
+                    left = ast.not_equal(left, right);
+                }
+                TokenId::OpAnd => {
+                    left = ast.and(left, right);
+                }
+                TokenId::OpOr => {
+                    left = ast.or(left, right);
+                }
                 x => return Err((ParseError::UnknownOperatorToken(x), binary_op.pos as usize)),
             }
         } else {
@@ -1054,7 +1125,6 @@ pub fn _parse(
         }
     }
 
-    println!("Out of loop..");
     Ok(left)
 }
 
@@ -1185,8 +1255,8 @@ mod tests {
             (">", OpGreater),
             ("<=", OpLessEqual),
             (">=", OpGreaterEqual),
-            ("&&", OpBoolAnd),
-            ("||", OpBoolOr),
+            ("&&", OpAnd),
+            ("||", OpOr),
             ("++", OpStrConcat),
             (">+", OpListCons),
             ("+<", OpListAppend),
@@ -2434,8 +2504,32 @@ mod tests {
 
         for op in ops {
             let input = format!("a {op} c");
-            let (root, ast) = parse_str(input).unwrap();
+            let (root, ast) = parse_str(&input).unwrap();
             let _ = ast.dump_dot(root, "/tmp/dump");
+
+            let left = NodeId(0);
+            let right = NodeId(1);
+
+            let node = match op {
+                "+" => Node::Add { left, right }, 
+                "-" => Node::Sub{ left, right }, 
+                "*" => Node::Mul { left, right }, 
+                "/" => Node::Div { left, right }, 
+                "^" => Node::Exp { left, right }, 
+                "%" => Node::Mod { left, right }, 
+                "==" => Node::Equal { left, right }, 
+                "/=" => Node::NotEqual { left, right }, 
+                "<" => Node::LessThan { left, right }, 
+                ">" => Node::GreaterThan { left, right },
+                "<=" => Node::LessEqual { left, right }, 
+                ">=" => Node::GreaterEqual { left, right },
+                "&&" => Node::BoolAnd { left, right }, 
+                "||" => Node::BoolOr { left, right }, 
+                "++" => Node::StrConcat { left, right }, 
+                ">+" => Node::ListCons { left, right }, 
+                "+<" => Node::ListAppend { left, right },
+                _ => unreachable!()
+            };
 
             assert_eq!(
                 ast,
@@ -2443,10 +2537,26 @@ mod tests {
                     nodes: vec![
                         Node::Var{ data: "a".to_string() },
                         Node::Var{ data: "c".to_string() },
-                        Node::ListAppend { left: NodeId(0), right: NodeId(1) },
+                        node
                     ]
                 }
             );
         }
+    }
+
+    #[test]
+    fn test_parse_empty_list() {
+        let input = "{}";
+        let (root, ast) = parse_str(input).unwrap();
+        let _ = ast.dump_dot(root, "/tmp/dump");
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::List { data: Vec::new() },
+                ]
+            }
+        );
     }
 }
