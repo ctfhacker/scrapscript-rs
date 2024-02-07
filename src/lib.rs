@@ -209,7 +209,7 @@ impl TokenId {
             OpMatchCase => Some((42, 42)),
             OpHasType => Some((41, 41)),
             OpAssign => Some((40, 40)),
-            OpWhere => Some((30, 29)),
+            OpWhere => Some((31, 30)),
             OpAssert => Some((30, 29)),
             OpRightEval => Some((29, 29)),
             Comma => Some((10, 10)),
@@ -341,10 +341,10 @@ impl Node {
             Node::Int { data } => format!("{data:#x}"),
             Node::Float { data } => format!("{data:.4}"),
             Node::List { .. } => {
-                format!("LIST")
+                "LIST".to_string()
             }
             Node::Record { .. } => {
-                format!("RECORD")
+                "RECORD".to_string()
             }
             Node::Var { data } => data.to_string(),
             Node::Bytes { data } => {
@@ -382,7 +382,7 @@ impl Node {
             Node::Spread { name } => {
                 let mut label = "...".to_string();
                 if let Some(name) = name {
-                    label.push_str(&name);
+                    label.push_str(name);
                 }
                 label
             }
@@ -464,7 +464,10 @@ pub enum ParseError {
     NonFunctionInMatch(TokenId),
 
     /// The name of a spread must be a name
-    NonVariableSpreadNameFound
+    NonVariableSpreadNameFound,
+
+    /// Parsed a non-leaf node as a first token
+    NonLeafNodeFoundFirst,
 }
 
 macro_rules! impl_from_err {
@@ -624,6 +627,11 @@ impl SyntaxTree {
     /// # Errors
     /// 
     /// * Failed to write the dot file
+    ///
+    /// # Panics
+    /// 
+    /// * TODO: Invalid match function
+    #[allow(clippy::too_many_lines)]
     pub fn dump_dot(&self, root: NodeId, out_name: &str) -> Result<(), std::io::Error> {
         let mut queue = vec![root];
         let mut seen_nodes = HashSet::new();
@@ -713,7 +721,7 @@ impl SyntaxTree {
                         .iter()
                         .enumerate().map(|(i, value)| {
                             let Node::MatchCase { left, .. } = self.nodes[*value] else {
-                                panic!("Non-matchcase in match function");
+                                panic!("ERROR: Non-matchcase in match function");
                             };
                             let case = &self.nodes[left];
 
@@ -1160,6 +1168,7 @@ pub fn parse(
 ///
 /// * Errors on parsing tokens and return the position of the error
 #[allow(clippy::too_many_lines)]
+#[allow(clippy::missing_panics_doc)]
 pub fn _parse(
     tokens: &[Token],
     token_index: &mut usize,
@@ -1361,16 +1370,12 @@ pub fn _parse(
                         let old_token_index = *token_index;
                         let token = _parse(tokens, token_index, input, ast, 20)?;
 
-                        match ast.nodes[token] {
-                            Node::Assign { left, right } => {
-                                keys.push(left);
-                                values.push(right);
-                            }
-                            _ => {
+                        if let  Node::Assign { left, right } = ast.nodes[token] {
+                            keys.push(left);
+                            values.push(right);
+                        } else {
                                 dbg!(&ast.nodes[token]);
                                 return Err((ParseError::NonAssignmentInRecord(tokens[old_token_index].id), next_token.pos as usize));
-                            }
-                            
                         }
 
                         prev_token = next_token.id; 
@@ -1381,7 +1386,7 @@ pub fn _parse(
                 ast.record(keys, values)
             }
             TokenId::EndOfFile | TokenId::RightBracket | TokenId::RightBrace | TokenId::RightParen => {
-                panic!("Reached non-leaf first?!");
+                return Err((ParseError::NonLeafNodeFoundFirst, start.pos as usize));
             }
             TokenId::OpMatchCase => {
                 let mut matches = Vec::new();
@@ -1397,12 +1402,11 @@ pub fn _parse(
 
                     dbg!(&ast.nodes[case]);
 
-                    match ast.nodes[case] {
-                        Node::Function { name, body } => {
+                    match ast.nodes.get(case.0) {
+                        Some(Node::Function { name, body }) => {
                             // Replace the Function with a MatchCase node
-                            ast.nodes[case] = Node::MatchCase { left: name, right: body };
-                            let result= matches.push(case);
-                            result
+                            ast.nodes[case] = Node::MatchCase { left: *name, right: *body };
+                            matches.push(case);
                         }
                         _ => {
                             return Err((ParseError::NonFunctionInMatch(tokens[old_token_index].id), next_token.pos as usize));
@@ -1514,9 +1518,8 @@ pub fn _parse(
 
                     // Only allow variables on left side of assignments
                     if !matches!(left_node, Node::Var { .. }) {
-                        if *token_index < 3 {
-                            panic!("Less than 3 tokens before hitting assign? {}", *token_index);
-                        }
+                        assert!(*token_index >= 3,
+                            "Less than 3 tokens before hitting assign? {}", *token_index);
 
                         let prev_token = tokens[*token_index - 3];
                         return Err((ParseError::NonVariableInAssignment, prev_token.pos as usize));
@@ -3610,11 +3613,11 @@ mod tests {
 
     #[test]
     fn test_parse_match_three_cases() {
-        let input = r#"
+        let input = r"
             | 1 -> a
             | 2 -> b
             | 3 -> c
-        "#;
+        ";
         let (_root, ast ) = parse_str(input).unwrap();
 
         assert_eq!(
@@ -3642,9 +3645,9 @@ mod tests {
 
     #[test]
     fn test_parse_compose() {
-        let input = r#"
+        let input = r"
             f >> g
-        "#;
+        ";
         let (_root, ast ) = parse_str(input).unwrap();
 
         assert_eq!(
@@ -3661,9 +3664,9 @@ mod tests {
 
     #[test]
     fn test_parse_compose_reverse() {
-        let input = r#"
+        let input = r"
             f << g
-        "#;
+        ";
         let (_root, ast ) = parse_str(input).unwrap();
 
         assert_eq!(
@@ -3680,9 +3683,9 @@ mod tests {
 
     #[test]
     fn test_parse_double_compose() {
-        let input = r#"
+        let input = r"
             f << g << h
-        "#;
+        ";
         let (_root, ast ) = parse_str(input).unwrap();
 
         assert_eq!(
@@ -3701,9 +3704,9 @@ mod tests {
 
     #[test]
     fn test_parse_and_tighter_than_or() {
-        let input = r#"
+        let input = r"
             x || y && z
-        "#;
+        ";
         let (_root, ast ) = parse_str(input).unwrap();
 
         assert_eq!(
@@ -3722,9 +3725,9 @@ mod tests {
 
     #[test]
     fn test_parse_list_spread() {
-        let input = r#"
+        let input = r"
             [1, ... ]
-        "#;
+        ";
         let (_root, ast ) = parse_str(input).unwrap();
 
         assert_eq!(
@@ -3741,9 +3744,9 @@ mod tests {
 
     #[test]
     fn test_parse_list_with_non_name_expr_after_spread_raises_parse_error() {
-        let input = r#"
+        let input = r"
             [1, ...rest]
-        "#;
+        ";
 
         let (root, ast) = parse_str(input).unwrap();
         let _ = ast.dump_dot(root, "/tmp/dump");
