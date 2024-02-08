@@ -1,5 +1,9 @@
+#![feature(concat_idents)]
 use core::ops::{Index, IndexMut};
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
+
+/// Error margin when comparing floats
+const FLOAT_ERROR_MARGIN: f64 = 0.000_000_000_001;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TokenId {
@@ -238,7 +242,7 @@ pub enum Node {
     Var { data: String },
 
     /// A symbol name
-    Symbol{ data: String },
+    Symbol { data: String },
 
     /// A vec of bytes
     Bytes { data: Vec<u8> },
@@ -269,6 +273,9 @@ pub enum Node {
 
     /// A divide operation between two nodes
     Div { left: NodeId, right: NodeId },
+
+    /// A floor divide operation between two nodes
+    FloorDiv { left: NodeId, right: NodeId },
 
     /// A modulo operation between two nodes
     Mod { left: NodeId, right: NodeId },
@@ -337,6 +344,18 @@ pub enum Node {
     Spread { name: Option<String> },
 }
 
+impl From<f64> for Node {
+    fn from(data: f64) -> Node { 
+        Node::Float { data }
+    }
+}
+
+impl From<i64> for Node {
+    fn from(data: i64) -> Node { 
+        Node::Int { data }
+    }
+}
+
 impl Node {
     #[must_use]
     pub fn label(&self) -> String {
@@ -358,6 +377,7 @@ impl Node {
             Node::Mul { .. } => "*".to_string(),
             Node::Exp { .. } => "^".to_string(),
             Node::Div { .. } => "/".to_string(),
+            Node::FloorDiv { .. } => "//".to_string(),
             Node::Mod { .. } => "%".to_string(),
             Node::GreaterThan { .. } => ">".to_string(),
             Node::GreaterEqual { .. } => ">=".to_string(),
@@ -473,7 +493,10 @@ pub enum ParseError {
     NonLeafNodeFoundFirst,
 
     /// Spread must come at the end of a record/list
-    SpreadMustComeAtEndOfCollection
+    SpreadMustComeAtEndOfCollection,
+
+    /// Token other than Int or Float found during a subtraction
+    NonIntFloatForSubtract    
 }
 
 macro_rules! impl_from_err {
@@ -495,6 +518,7 @@ impl_from_err!(ParseError, Base64, base64::DecodeError);
 #[derive(Default, Debug, PartialEq)]
 pub struct SyntaxTree {
     nodes: Vec<Node>,
+    positions: Vec<u32>
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -523,13 +547,9 @@ impl IndexMut<NodeId> for Vec<Node> {
 /// Implement a node that has a single `data` child
 macro_rules! impl_data_node {
     ($func_name:ident, $node:ident, $ty:ty) => {
-        pub fn $func_name(&mut self, data: $ty) -> NodeId {
-            let node_index = self.nodes.len();
-
+        pub fn $func_name(&mut self, data: $ty, pos: u32) -> NodeId {
             let node = Node::$node { data };
-            self.nodes.push(node);
-
-            NodeId(node_index)
+            self.add_node(node, pos)
         }
     };
 }
@@ -537,13 +557,9 @@ macro_rules! impl_data_node {
 /// Implement a node that has `left` and `right` children
 macro_rules! impl_left_right_node {
     ($func_name:ident, $node:ident) => {
-        pub fn $func_name(&mut self, left: NodeId, right: NodeId) -> NodeId {
-            let node_index = self.nodes.len();
-
+        pub fn $func_name(&mut self, left: NodeId, right: NodeId, pos: u32) -> NodeId {
             let node = Node::$node { left, right };
-            self.nodes.push(node);
-
-            NodeId(node_index)
+            self.add_node(node, pos)
         }
     };
 }
@@ -615,6 +631,7 @@ impl SyntaxTree {
     impl_left_right_node!(mul, Mul);
     impl_left_right_node!(exp, Exp);
     impl_left_right_node!(div, Div);
+    impl_left_right_node!(floor_div, FloorDiv);
     impl_left_right_node!(modulo, Mod);
     impl_left_right_node!(greater_than, GreaterThan);
     impl_left_right_node!(greater_equal, GreaterEqual);
@@ -637,51 +654,40 @@ impl SyntaxTree {
     impl_left_right_node!(match_case, MatchCase);
     impl_left_right_node!(compose, Compose);
 
-    pub fn hole(&mut self) -> NodeId {
+    /// Add the given [`Node`] at `pos` into this [`SyntaxTree`]
+    pub fn add_node(&mut self, node: Node, pos: u32) -> NodeId {
         let node_index = self.nodes.len();
-
-        let node = Node::Hole;
         self.nodes.push(node);
+        self.positions.push(pos);
 
         NodeId(node_index)
     }
 
-    pub fn spread(&mut self, name: Option<String>) -> NodeId {
-        let node_index = self.nodes.len();
+    pub fn hole(&mut self, pos: u32) -> NodeId {
+        let node = Node::Hole;
+        self.add_node(node, pos)
+    }
 
+    pub fn spread(&mut self, name: Option<String>, pos: u32) -> NodeId {
         let node = Node::Spread { name };
-        self.nodes.push(node);
-
-        NodeId(node_index)
+        self.add_node(node, pos)
     }
 
     /// Insert a record node with the given `keys` and `values`
-    pub fn record(&mut self, keys: Vec<NodeId>, values: Vec<NodeId>) -> NodeId {
-        let node_index = self.nodes.len();
-
+    pub fn record(&mut self, keys: Vec<NodeId>, values: Vec<NodeId>, pos: u32) -> NodeId {
         let node = Node::Record { keys, values };
-        self.nodes.push(node);
-
-        NodeId(node_index)
+        self.add_node(node, pos)
     }
 
     /// Insert a function node with the given `name` and `body`
-    pub fn function(&mut self, name: NodeId, body: NodeId) -> NodeId {
-        let node_index = self.nodes.len();
-
+    pub fn function(&mut self, name: NodeId, body: NodeId, pos: u32) -> NodeId {
         let node = Node::Function { name, body};
-        self.nodes.push(node);
-
-        NodeId(node_index)
+        self.add_node(node, pos)
     }
 
-    pub fn match_function(&mut self, data: Vec<NodeId>) -> NodeId {
-        let node_index = self.nodes.len();
-
+    pub fn match_function(&mut self, data: Vec<NodeId>, pos: u32) -> NodeId {
         let node = Node::MatchFunction { data };
-        self.nodes.push(node);
-
-        NodeId(node_index)
+        self.add_node(node, pos)
     }
 
     /// Dump a .dot of this syntax tree
@@ -719,6 +725,7 @@ impl SyntaxTree {
                 | Node::Mul { left, right }
                 | Node::Exp { left, right }
                 | Node::Div { left, right }
+                | Node::FloorDiv { left, right }
                 | Node::Mod { left, right }
                 | Node::Apply { left, right }
                 | Node::ListAppend { left, right }
@@ -820,6 +827,160 @@ impl SyntaxTree {
 
         std::fs::write(out_name, dot)
     }
+
+    /// Print the input with each node marked by a `v`
+    #[allow(clippy::missing_panics_doc)]
+    #[allow(clippy::cast_possible_truncation)]
+    pub fn print_nodes(&self, input: &str) {
+        let mut debug = vec![b' '; input.len()];
+        input.chars()
+             .enumerate()
+             .filter(|(_index, byte)| *byte == '\n')
+             .for_each(|(index, _byte)| debug[index] = b'\n');
+
+        self.positions
+            .iter()
+            .filter(|i| **i < input.len() as u32)
+            .for_each(|i| debug[*i as usize] = b'v');
+
+        for (dbg, data) in debug.split(|x| *x == b'\n').zip(input.split(|x| x == '\n')) {
+            println!("{}", std::str::from_utf8(dbg).unwrap());
+            println!("{data}");
+        }
+
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum EvalError {
+    InvalidAssignmentVariable,
+    InvalidNodeTypes(Node),
+    ExponentPowerTooLarge(i64)
+}
+
+/// Evaluate the given node at `root` using the given context `ctx`
+///
+/// # Errors
+/// 
+/// * See [`EvalError`]
+///
+/// # Panics
+/// 
+/// * An error position cannot fit in `usize`
+pub fn eval<S: std::hash::BuildHasher>(
+        ctx: &mut HashMap<String, NodeId, S>, 
+        ast: &SyntaxTree, 
+        root: NodeId) -> Result<Node, (EvalError, u32)> {
+    let curr_node = &ast.nodes[root];
+
+    match curr_node {
+        Node::Add { left, right } 
+        | Node::Sub { left, right }
+        | Node::Mul { left, right }
+        | Node::Div { left, right }
+        | Node::FloorDiv { left, right }
+        | Node::Exp { left, right }
+        | Node::Mod { left, right }
+        | Node::Equal { left, right }
+        => {
+            let left_data = eval(ctx, ast, *left)?;
+            let right_data = eval(ctx, ast, *right)?;
+
+            dbg!(&left_data);
+            dbg!(&right_data);
+
+            match (left_data, right_data) {
+                (Node::Int { data: left_int}, Node::Int { data: right_int}) => {
+                    let data= match curr_node {
+                        Node::Add { .. } =>  left_int + right_int ,
+                        Node::Sub { .. } =>  left_int - right_int ,
+                        Node::Mul { .. } =>  left_int * right_int ,
+                        Node::Mod { .. } =>  left_int % right_int ,
+                        Node::Equal { .. } => {
+                            if left_int == right_int {
+                                return Ok(Node::Symbol { data: "true".to_string()});
+                            } 
+                                
+                            return Ok(Node::Symbol { data: "false".to_string()});
+                        }
+                        Node::Div { .. } | Node::FloorDiv { .. } =>  left_int / right_int,
+                        Node::Exp { .. } =>  {
+                            let Ok(right) = right_int.try_into() else {
+                                return Err((EvalError::ExponentPowerTooLarge(right_int), ast.positions[right.0]));
+                            };
+
+                            dbg!(left_int);
+                            dbg!(right);
+                            left_int.pow(right)
+                        }
+                        _ => unreachable!("{curr_node:?}")
+                    };
+
+                    Ok(Node:: Int { data })
+                }
+                (left @ (Node::Float { .. } | Node::Int { data: 0}), Node::Float { data: right }) => {
+                    // A negative float is represented by a `0 - floatnum`. We need 
+                    // to convert this zero to a floating point zero
+                    let left = match left {
+                        Node::Float { data} => data,
+                        Node::Int { data: 0 } => 0.0,
+                        _ => unreachable!()
+                    };
+
+                    let data = match curr_node {
+                        Node::Add { .. } =>  left + right,
+                        Node::Sub { .. } =>  left - right,
+                        Node::Mul { .. } =>  left * right,
+                        Node::Div { .. } =>  left / right,
+                        Node::Mod { .. } =>  left % right,
+                        Node::Exp { .. } =>  left.powf(right),
+                        Node::FloorDiv { .. } =>  (left / right).floor(),
+                        Node::Equal { .. } => {
+                            // 
+                            let l_abs = left.abs();
+                            let r_abs = right.abs();
+                            let diff = (left - right).abs();
+
+                            let result = if (left - right).abs() < FLOAT_ERROR_MARGIN {
+                                true
+                            } else if left == 0.0 || right == 0.0 || (l_abs + r_abs < f64::MIN_POSITIVE) {
+                                diff < f64::EPSILON * f64::MIN_POSITIVE
+                            } else {
+                                diff / (l_abs + r_abs).min(f64::MAX) < f64::EPSILON
+                            };
+                                
+                            if result {
+                                return Ok(Node::Symbol { data: "true".to_string()});
+                            }
+
+                            return Ok(Node::Symbol { data: "false".to_string()});
+                        }
+                        _ => unreachable!("{curr_node:?}")
+                    };
+
+                    Ok(Node::Float { data })
+                }
+                _ => {
+                    Err((EvalError::InvalidNodeTypes(curr_node.clone()), ast.positions[root.0]))
+                }
+            }
+        }
+        Node::Assign { left, right } => {
+            let Node::Var { data: ref var} = ast.nodes[*left] else {
+                return Err((EvalError::InvalidAssignmentVariable, ast.positions[left.0]));
+            };
+
+            ctx.insert(var.to_string(), *right);
+
+            Ok(curr_node.clone())
+        }
+        Node::Int { .. } | Node::Float { .. } | Node::Var { .. } => {
+            // Base case.. Return the node as is. Nothing more to evaluate
+            Ok(curr_node.clone())
+        }
+        _ => unimplemented!("{curr_node:?}")
+    }
+    
 }
 
 /// Convert the input program into a list of tokens
@@ -1205,7 +1366,10 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
 pub fn parse_str(input: &str) -> Result<(NodeId, SyntaxTree), Error> {
     let tokens = tokenize(input)?;
     // dbg!(&tokens);
-    Ok(parse(&tokens, input)?)
+    let (node, ast) = parse(&tokens, input)?;
+    ast.print_nodes(input);
+
+    Ok((node, ast))
 }
 
 
@@ -1270,9 +1434,6 @@ pub fn _parse(
             };
         }
 
-
-        dbg!(&start);
-
         // Parse the next leaf token
         let leaf = match start.id {
             TokenId::OpSpread => {
@@ -1305,7 +1466,7 @@ pub fn _parse(
                     return Err((ParseError::SpreadMustComeAtEndOfCollection, 1));
                 }
 
-                ast.spread(spread_name)
+                ast.spread(spread_name, start.pos)
             }
             TokenId::Int => {
                 continue_while!(is_valid_int_byte);
@@ -1315,7 +1476,7 @@ pub fn _parse(
                     .map_err(|e| (ParseError::Int(e), input_index))?;
 
                 // Add an Int node
-                ast.int(value)
+                ast.int(value, input_index.try_into().unwrap())
             }
             TokenId::Float => {
                 continue_while!(is_valid_float_byte);
@@ -1325,24 +1486,22 @@ pub fn _parse(
                     .map_err(|e| (ParseError::Float(e), input_index))?;
 
                 // Add an Int node
-                ast.float(value)
+                ast.float(value, input_index.try_into().unwrap())
             }
             TokenId::OpSub => {
-                let zero_int = ast.int(0);
-
-                let right = _parse(tokens, token_index, input, ast, 5000)?;
-
-                ast.sub(zero_int, right)
+                let zero = ast.int(0, u32::MAX);
+                let right = _parse(tokens, token_index, input, ast, u32::MAX)?;
+                ast.sub(zero, right, input_index.try_into().unwrap())
             }
             TokenId::Name => {
                 continue_while!(is_valid_name_byte);
                 let name = input[input_index..=end_input_index].to_string();
-                ast.name(name)
+                ast.name(name, input_index.try_into().unwrap())
             }
             TokenId::Symbol => {
                 continue_while!(is_valid_symbol_byte);
                 let name = input[input_index..=end_input_index].to_string();
-                ast.symbol(name)
+                ast.symbol(name, (input_index - 1).try_into().unwrap())
             }
             TokenId::Base85 => {
                 continue_while!(is_valid_base85_byte);
@@ -1350,7 +1509,7 @@ pub fn _parse(
 
                 let bytes = base85::decode(name)
                     .map_err(|e| (ParseError::Base85(e), start.pos as usize))?;
-                ast.bytes(bytes)
+                ast.bytes(bytes, input_index.try_into().unwrap())
             }
             TokenId::Base64 => {
                 use base64::Engine;
@@ -1364,7 +1523,7 @@ pub fn _parse(
                     .map_err(|e| (ParseError::Base64(e), start.pos as usize))?;
 
                 // Create the decoded bytes string
-                ast.bytes(bytes)
+                ast.bytes(bytes, input_index.try_into().unwrap())
             }
             TokenId::LeftBracket => {
                 // Parse a list
@@ -1403,12 +1562,12 @@ pub fn _parse(
                     
                 }
 
-                ast.list(nodes)
+                ast.list(nodes, input_index.try_into().unwrap())
             }
             TokenId::LeftParen => {
                 let next_token = tokens[*token_index];
                 if matches!(next_token.id, TokenId::RightParen) {
-                    ast.hole()
+                    ast.hole(start.pos)
                 } else {
                     let result =  _parse(tokens, token_index, input, ast, 0)?;
 
@@ -1469,7 +1628,7 @@ pub fn _parse(
                     }
                 }
 
-                ast.record(keys, values)
+                ast.record(keys, values, input_index.try_into().unwrap())
             }
             TokenId::EndOfFile | TokenId::RightBracket | TokenId::RightBrace | TokenId::RightParen => {
                 return Err((ParseError::NonLeafNodeFoundFirst, start.pos as usize));
@@ -1500,12 +1659,10 @@ pub fn _parse(
                     }
                 }
 
-                ast.match_function(matches)
+                ast.match_function(matches, start.pos)
             }
             x => return Err((ParseError::UnknownToken(x), start.pos as usize)),
         };
-
-        dbg!(&leaf);
 
         Ok(leaf)
     };
@@ -1548,58 +1705,61 @@ pub fn _parse(
                 }
 
                 TokenId::OpAdd => {
-                    left = ast.add(left, right);
+                    left = ast.add(left, right, binary_op.pos);
                 }
                 TokenId::OpSub => {
-                    left = ast.sub(left, right);
+                    left = ast.sub(left, right, binary_op.pos);
                 }
                 TokenId::OpMul => {
-                    left = ast.mul(left, right);
+                    left = ast.mul(left, right, binary_op.pos);
                 }
                 TokenId::OpExp => {
-                    left = ast.exp(left, right);
+                    left = ast.exp(left, right, binary_op.pos);
                 }
                 TokenId::OpGreater => {
-                    left = ast.greater_than(left, right);
+                    left = ast.greater_than(left, right, binary_op.pos);
                 }
                 TokenId::OpGreaterEqual => {
-                    left = ast.greater_equal(left, right);
+                    left = ast.greater_equal(left, right, binary_op.pos);
                 }
                 TokenId::OpLess => {
-                    left = ast.less_than(left, right);
+                    left = ast.less_than(left, right, binary_op.pos);
                 }
                 TokenId::OpLessEqual => {
-                    left = ast.less_equal(left, right);
+                    left = ast.less_equal(left, right, binary_op.pos);
                 }
                 TokenId::OpAccess => {
-                    left = ast.access(left, right);
+                    left = ast.access(left, right, binary_op.pos);
                 }
                 TokenId::OpListAppend => {
-                    left = ast.list_append(left, right);
+                    left = ast.list_append(left, right, binary_op.pos);
                 }
                 TokenId::OpStrConcat => {
-                    left = ast.str_concat(left, right);
+                    left = ast.str_concat(left, right, binary_op.pos);
                 }
                 TokenId::OpListCons => {
-                    left = ast.list_cons(left, right);
+                    left = ast.list_cons(left, right, binary_op.pos);
                 }
                 TokenId::OpDiv => {
-                    left = ast.div(left, right);
+                    left = ast.div(left, right, binary_op.pos);
+                }
+                TokenId::OpFloorDiv => {
+                    left = ast.floor_div(left, right, binary_op.pos);
                 }
                 TokenId::OpMod => {
-                    left = ast.modulo(left, right);
+                    left = ast.modulo(left, right, binary_op.pos);
                 }
                 TokenId::OpEqual => {
-                    left = ast.equal(left, right);
+                    left = ast.equal(left, right, binary_op.pos);
                 }
                 TokenId::OpNotEqual => {
-                    left = ast.not_equal(left, right);
+                    left = ast.not_equal(left, right, binary_op.pos);
                 }
                 TokenId::OpAnd => {
-                    left = ast.and(left, right);
+                    left = ast.and(left, right, binary_op.pos);
                 }
                 TokenId::OpOr => {
-                    left = ast.or(left, right);
+                    left = ast.or(left, right, binary_op.pos);
                 }
                 TokenId::OpAssign => {
                     let left_node = &ast.nodes[left];
@@ -1613,34 +1773,34 @@ pub fn _parse(
                         return Err((ParseError::NonVariableInAssignment, prev_token.pos as usize));
                     }
 
-                    left = ast.assign(left, right);
+                    left = ast.assign(left, right, binary_op.pos);
                 }
                 TokenId::OpFunction => {
-                    left = ast.function(left, right);
+                    left = ast.function(left, right, binary_op.pos);
                 }
                 TokenId::OpWhere => {
-                    left = ast.where_op(left, right);
+                    left = ast.where_op(left, right, binary_op.pos);
                 }
                 TokenId::OpAssert => {
-                    left = ast.assert(left, right);
+                    left = ast.assert(left, right, binary_op.pos);
                 }
                 TokenId::OpHasType => {
-                    left = ast.has_type(left, right);
+                    left = ast.has_type(left, right, binary_op.pos);
                 }
                 TokenId::OpPipe => {
-                    left = ast.apply(right, left);
+                    left = ast.apply(right, left, binary_op.pos);
                 }
                 TokenId::OpReversePipe => {
-                    left = ast.apply(left, right);
+                    left = ast.apply(left, right, binary_op.pos);
                 }
                 TokenId::OpRightEval => {
-                    left = ast.right_eval(left, right);
+                    left = ast.right_eval(left, right, binary_op.pos);
                 }
                 TokenId::OpCompose => {
-                    left = ast.compose(left, right);
+                    left = ast.compose(left, right, binary_op.pos);
                 }
                 TokenId::OpComposeReverse => {
-                    left = ast.compose(right, left);
+                    left = ast.compose(right, left, binary_op.pos);
                 }
                 x => {
                     return Err((ParseError::UnknownOperatorToken(x), binary_op.pos as usize));
@@ -1654,7 +1814,7 @@ pub fn _parse(
             }
 
             let right = _parse(tokens, token_index, input, ast, OPAPPLY_PRECEDENCE + 2)?;
-            left = ast.apply(left, right);
+            left = ast.apply(left, right, next.pos - 1);
         }
 
         // Base case: The tree didn't move, we've reached the end
@@ -2500,7 +2660,8 @@ mod tests {
         assert_eq!(
             ast,
             SyntaxTree {
-                nodes: vec![Node::Int { data: 1 }]
+                nodes: vec![Node::Int { data: 1 }],
+                positions: vec![0]
             }
         );
     }
@@ -2512,7 +2673,8 @@ mod tests {
         assert_eq!(
             ast,
             SyntaxTree {
-                nodes: vec![Node::Int { data: 123 }]
+                nodes: vec![Node::Int { data: 123 }],
+                positions: vec![0]
             }
         );
     }
@@ -2532,7 +2694,8 @@ mod tests {
                         left: NodeId(0),
                         right: NodeId(1)
                     }
-                ]
+                ],
+                positions: vec![u32::MAX, 1, 0]
             }
         );
     }
@@ -2554,7 +2717,8 @@ mod tests {
                         left: NodeId(0),
                         right: NodeId(1)
                     }
-                ]
+                ],
+                positions: vec![u32::MAX, 1, 0]
             }
         );
     }
@@ -2583,7 +2747,8 @@ mod tests {
                         left: NodeId(2),
                         right: NodeId(3)
                     },
-                ]
+                ],
+                positions: vec![u32::MAX, 1, 0, 3, 2]
             }
         );
     }
@@ -2612,7 +2777,8 @@ mod tests {
                         left: NodeId(2),
                         right: NodeId(3)
                     },
-                ]
+                ],
+                positions: vec![u32::MAX, 1, 0, 3, 2]
             }
         );
     }
@@ -2641,7 +2807,8 @@ mod tests {
                         left: NodeId(2),
                         right: NodeId(3)
                     },
-                ]
+                ],
+                positions: vec![u32::MAX, 1, 0, 3, 2]
             }
         );
     }
@@ -2670,7 +2837,8 @@ mod tests {
                         left: NodeId(2),
                         right: NodeId(3)
                     },
-                ]
+                ],
+                positions: vec![u32::MAX, 1, 0, 3, 2]
             }
         );
     }
@@ -2683,7 +2851,8 @@ mod tests {
         assert_eq!(
             ast,
             SyntaxTree {
-                nodes: vec![Node::Float { data: 3.42 },]
+                nodes: vec![Node::Float { data: 3.42 },],
+                positions: vec![0]
             }
         );
     }
@@ -2702,7 +2871,8 @@ mod tests {
                         left: NodeId(0),
                         right: NodeId(1)
                     }
-                ]
+                ],
+                positions: vec![u32::MAX, 1, 0]
             }
         );
     }
@@ -2716,7 +2886,8 @@ mod tests {
             SyntaxTree {
                 nodes: vec![Node::Var {
                     data: "abc_123".to_string()
-                },]
+                }],
+                positions: vec![0]
             }
         );
     }
@@ -2731,7 +2902,8 @@ mod tests {
             SyntaxTree {
                 nodes: vec![Node::Var {
                     data: "$sha1'abc".to_string()
-                },]
+                }],
+                positions: vec![0]
             }
         );
     }
@@ -2746,7 +2918,8 @@ mod tests {
             SyntaxTree {
                 nodes: vec![Node::Var {
                     data: "$sha1'abc".to_string()
-                },]
+                }],
+                positions: vec![0]
             }
         );
     }
@@ -2761,7 +2934,8 @@ mod tests {
             SyntaxTree {
                 nodes: vec![Node::Var {
                     data: "$$".to_string()
-                },]
+                }],
+                positions: vec![0]
             }
         );
     }
@@ -2776,7 +2950,8 @@ mod tests {
             SyntaxTree {
                 nodes: vec![Node::Var {
                     data: "$".to_string()
-                },]
+                }],
+                positions: vec![0]
             }
         );
     }
@@ -2791,6 +2966,7 @@ mod tests {
                 nodes: vec![Node::Var {
                     data: "$$bills".to_string()
                 },]
+                ,positions: vec![0]
             }
         );
     }
@@ -2806,6 +2982,7 @@ mod tests {
                 nodes: vec![Node::Bytes {
                     data: "ABC".as_bytes().to_vec()
                 },]
+                ,positions: vec![5]
             }
         );
     }
@@ -2820,7 +2997,8 @@ mod tests {
             SyntaxTree {
                 nodes: vec![Node::Bytes {
                     data: "ABC".as_bytes().to_vec()
-                },]
+                }],
+                positions: vec![5]
             }
         );
     }
@@ -2841,6 +3019,7 @@ mod tests {
                         right: NodeId(1)
                     }
                 ]
+                ,positions: vec![0, 2, 1]
             }
         );
     }
@@ -2860,7 +3039,8 @@ mod tests {
                         left: NodeId(0),
                         right: NodeId(1)
                     }
-                ]
+                ],
+                positions: vec![0, 2, 1]
             }
         );
     }
@@ -2885,7 +3065,8 @@ mod tests {
                         left: NodeId(0),
                         right: NodeId(3)
                     }
-                ]
+                ],
+                positions: vec![0,2,4,3,1]
             }
         );
     }
@@ -2911,6 +3092,7 @@ mod tests {
                         right: NodeId(3)
                     }
                 ]
+                ,positions: vec![0, 2, 4, 3, 1]
             }
         );
     }
@@ -2936,6 +3118,7 @@ mod tests {
                         right: NodeId(3)
                     }
                 ]
+                ,positions: vec![0, 2, 1, 4, 3]
             }
         );
     }
@@ -2957,7 +3140,8 @@ mod tests {
                         left: NodeId(0),
                         right: NodeId(3)
                     }
-                ]
+                ],
+                positions: vec![0,2,4,3,1]
             }
         );
     }
@@ -2977,6 +3161,7 @@ mod tests {
                     Node::Access { left: NodeId(1), right: NodeId(2) },
                     Node::ListAppend{ left: NodeId(0), right: NodeId(3) },
                 ]
+                ,positions: vec![0,5,8,7,2]
             }
         );
     }
@@ -2993,7 +3178,8 @@ mod tests {
                     Node::Var{ data: "abc".to_string() },
                     Node::Var{ data: "def".to_string() },
                     Node::StrConcat { left: NodeId(0), right: NodeId(1) },
-                ]
+                ],
+                positions: vec![0, 7, 4]
             }
         );
     }
@@ -3010,7 +3196,8 @@ mod tests {
                     Node::Var{ data: "a".to_string() },
                     Node::Var{ data: "c".to_string() },
                     Node::ListCons { left: NodeId(0), right: NodeId(1) },
-                ]
+                ],
+                positions: vec![0, 5, 2]
             }
         );
     }
@@ -3027,7 +3214,8 @@ mod tests {
                     Node::Var{ data: "a".to_string() },
                     Node::Var{ data: "c".to_string() },
                     Node::ListAppend { left: NodeId(0), right: NodeId(1) },
-                ]
+                ],
+                positions: vec![0, 5, 2]
             }
         );
     }
@@ -3073,7 +3261,10 @@ mod tests {
                         Node::Var{ data: "a".to_string() },
                         Node::Var{ data: "c".to_string() },
                         node
-                    ]
+                    ],
+
+                    #[allow(clippy::cast_possible_truncation)]
+                    positions: vec![0, 3 + op.len() as u32, 2]
                 }
             );
         }
@@ -3090,6 +3281,7 @@ mod tests {
                 nodes: vec![
                     Node::List { data: vec![] },
                 ]
+                ,positions: vec![0]
             }
         );
     }
@@ -3104,7 +3296,8 @@ mod tests {
             SyntaxTree {
                 nodes: vec![
                     Node::List { data: vec![] },
-                ]
+                ],
+                positions: vec![0]
             }
         );
     }
@@ -3121,7 +3314,8 @@ mod tests {
                     Node::Int { data: 1 },
                     Node::Int { data: 2 },
                     Node::List { data: vec![ NodeId(0), NodeId(1) ] },
-                ]
+                ],
+                positions: vec![2, 6, 0]
             }
         );
     }
@@ -3146,6 +3340,7 @@ mod tests {
                     Node::List { data: vec![ NodeId(6), NodeId(7) ] },
                     Node::List { data: vec![ NodeId(2), NodeId(5), NodeId(8) ] },
                 ]
+                ,positions: vec![1, 3, 2, 6, 8, 7, 12, 14, 11, 0]
             }
         );
     }
@@ -3169,7 +3364,8 @@ mod tests {
                     Node::Var { data: "b".to_string() },
                     Node::List { data: vec![ NodeId(6), NodeId(7) ] },
                     Node::List { data: vec![ NodeId(2), NodeId(5), NodeId(8) ] },
-                ]
+                ],
+                positions: vec![1, 3, 2, 6, 8, 7, 12, 14, 11, 0]
             }
         );
     }
@@ -3210,7 +3406,8 @@ mod tests {
                     Node::Var { data: "a".to_string() },
                     Node::Int { data: 1 },
                     Node::Assign { left: NodeId(0), right: NodeId(1) },
-                ]
+                ],
+                positions: vec![0,4,2]
             }
         );
     }
@@ -3229,7 +3426,8 @@ mod tests {
                     Node::Int { data: 1 },
                     Node::Add { left: NodeId(1), right: NodeId(2) },
                     Node::Function { name: NodeId(0), body: NodeId(3) },
-                ]
+                ],
+                positions: vec![0, 5, 9, 7, 2]
             }
         );
     }
@@ -3251,7 +3449,8 @@ mod tests {
                     Node::Add { left: NodeId(2), right: NodeId(3) },
                     Node::Function { name: NodeId(1), body: NodeId(4) },
                     Node::Function { name: NodeId(0), body: NodeId(5) },
-                ]
+                ],
+                positions: vec![0, 5, 10, 14, 12, 7, 2]
             }
         );
     }
@@ -3270,7 +3469,8 @@ mod tests {
                     Node::Var { data: "x".to_string() },
                     Node::Function { name: NodeId(1), body: NodeId(2) },
                     Node::Assign{ left: NodeId(0), right: NodeId(3) },
-                ]
+                ],
+                positions: vec![0, 5, 10, 7, 3]
             }
         );
     }
@@ -3287,7 +3487,8 @@ mod tests {
                     Node::Var { data: "f".to_string() },
                     Node::Var { data: "a".to_string() },
                     Node::Apply { left: NodeId(0), right: NodeId(1) },
-                ]
+                ],
+                positions: vec![0,2,1]
             }
         );
     }
@@ -3306,7 +3507,8 @@ mod tests {
                     Node::Apply { left: NodeId(0), right: NodeId(1) },
                     Node::Var { data: "b".to_string() },
                     Node::Apply { left: NodeId(2), right: NodeId(3) },
-                ]
+                ],
+                positions: vec![0,2,1,4,3]
             }
         );
     }
@@ -3323,7 +3525,8 @@ mod tests {
                     Node::Var { data: "a".to_string() },
                     Node::Var { data: "b".to_string() },
                     Node::Where { left: NodeId(0), right: NodeId(1) },
-                ]
+                ],
+                positions: vec![0, 4, 2]
             }
         );
     }
@@ -3342,7 +3545,8 @@ mod tests {
                     Node::Where { left: NodeId(0), right: NodeId(1) },
                     Node::Var { data: "c".to_string() },
                     Node::Where { left: NodeId(2), right: NodeId(3) },
-                ]
+                ],
+                positions: vec![0, 4, 2, 8, 6]
             }
         );
     }
@@ -3360,6 +3564,7 @@ mod tests {
                     Node::Var { data: "b".to_string() },
                     Node::Assert { left: NodeId(0), right: NodeId(1) },
                 ]
+                ,positions: vec![0,4,2]
             }
         );
     }
@@ -3378,7 +3583,8 @@ mod tests {
                     Node::Assert { left: NodeId(0), right: NodeId(1) },
                     Node::Var { data: "c".to_string() },
                     Node::Assert { left: NodeId(2), right: NodeId(3) },
-                ]
+                ],
+                positions: vec![0, 4, 2, 8, 6]
             }
         );
     }
@@ -3395,7 +3601,8 @@ mod tests {
                     Node::Var { data: "a".to_string() },
                     Node::Var { data: "b".to_string() },
                     Node::HasType { left: NodeId(0), right: NodeId(1) },
-                ]
+                ],
+                positions: vec![0, 4, 2]
             }
         );
     }
@@ -3410,7 +3617,8 @@ mod tests {
             SyntaxTree {
                 nodes: vec![
                     Node::Hole,
-                ]
+                ],
+                positions: vec![0]
             }
         );
     }
@@ -3427,7 +3635,8 @@ mod tests {
                     Node::Int { data: 1 },
                     Node::Int { data: 2 },
                     Node::Add{ left: NodeId(0), right: NodeId(1) },
-                ]
+                ],
+                positions: vec![1, 3, 2]
             }
         );
     }
@@ -3446,7 +3655,8 @@ mod tests {
                     Node::Add { left: NodeId(0), right: NodeId(1) },
                     Node::Int { data: 3 },
                     Node::Mul { left: NodeId(2), right: NodeId(3) },
-                ]
+                ],
+                positions: vec![1, 3, 2, 6, 5]
             }
         );
     }
@@ -3463,7 +3673,8 @@ mod tests {
                     Node::Int { data: 1 },
                     Node::Var { data: "f".to_string() },
                     Node::Apply { left: NodeId(1), right: NodeId(0) },
-                ]
+                ],
+                positions: vec![0, 5, 2]
             }
         );
     }
@@ -3483,6 +3694,7 @@ mod tests {
                     Node::Var { data: "g".to_string() },
                     Node::Apply { left: NodeId(3), right: NodeId(2) },
                 ]
+                ,positions: vec![0, 5, 2, 10, 7]
             }
         );
     }
@@ -3499,7 +3711,8 @@ mod tests {
                     Node::Var { data: "f".to_string() },
                     Node::Int { data: 1 },
                     Node::Apply { left: NodeId(0), right: NodeId(1) },
-                ]
+                ],
+                positions: vec![0, 5, 2]
             }
         );
     }
@@ -3518,7 +3731,8 @@ mod tests {
                     Node::Int { data: 1 },
                     Node::Apply { left: NodeId(1), right: NodeId(2) },
                     Node::Apply { left: NodeId(0), right: NodeId(3) },
-                ]
+                ],
+                positions: vec![0, 5, 10, 7, 2]
             }
         );
     }
@@ -3533,7 +3747,8 @@ mod tests {
             SyntaxTree {
                 nodes: vec![
                     Node::Record { keys: Vec::new(), values: Vec::new() },
-                ]
+               ],
+               positions: vec![0]
             }
         );
     }
@@ -3554,7 +3769,8 @@ mod tests {
                         keys: vec![NodeId(0)], 
                         values: vec![NodeId(1)]
                     },
-                ]
+                ],
+                positions: vec![2, 4, 3, 0]
             }
         );
     }
@@ -3577,7 +3793,8 @@ mod tests {
                         keys: vec![NodeId(0)], 
                         values: vec![NodeId(3)]
                     },
-                ]
+                ],
+                positions: vec![2, 4, 6, 5, 3, 0]
             }
         );
     }
@@ -3601,7 +3818,8 @@ mod tests {
                         keys: vec![NodeId(0), NodeId(3)], 
                         values: vec![NodeId(1), NodeId(4)]
                     },
-                ]
+                ],
+                positions: vec![2, 4, 3, 7, 9, 8, 0]
             }
         );
     }
@@ -3646,7 +3864,8 @@ mod tests {
                     Node::Var { data: "a".to_string() },
                     Node::Var { data: "b".to_string() },
                     Node::RightEval{ left: NodeId(0), right: NodeId(1) },
-                ]
+                ],
+                positions: vec![0, 2, 1]
             }
         );
     }
@@ -3665,7 +3884,8 @@ mod tests {
                     Node::Var { data: "c".to_string() },
                     Node::Where{ left: NodeId(1), right: NodeId(2) },
                     Node::RightEval{ left: NodeId(0), right: NodeId(3) },
-                ]
+                ],
+                positions: vec![0, 4, 8, 6, 2]
             }
         );
     }
@@ -3694,7 +3914,8 @@ mod tests {
                     Node::Int { data: 2 },
                     Node::MatchCase { left: NodeId(0), right: NodeId(1) },
                     Node::MatchFunction { data: vec![NodeId(2)]},
-                ]
+                ],
+                positions: vec![2, 7, 4, 0]
             }
         );
     }
@@ -3726,16 +3947,15 @@ mod tests {
                         NodeId(5),
                         NodeId(8),
                     ]},
-                ]
+                ],
+                positions: vec![15, 20, 17, 36, 41, 38, 57, 62, 59, 13]
             }
         );
     }
 
     #[test]
     fn test_parse_compose() {
-        let input = r"
-            f >> g
-        ";
+        let input = r"f >> g";
         let (_root, ast ) = parse_str(input).unwrap();
 
         assert_eq!(
@@ -3746,15 +3966,14 @@ mod tests {
                     Node::Var { data: "g".to_string() },
                     Node::Compose { left: NodeId(0), right: NodeId(1) }
                 ]
+                ,positions: vec![0, 5, 2]
             }
         );
     }
 
     #[test]
     fn test_parse_compose_reverse() {
-        let input = r"
-            f << g
-        ";
+        let input = r"f << g";
         let (_root, ast ) = parse_str(input).unwrap();
 
         assert_eq!(
@@ -3764,16 +3983,15 @@ mod tests {
                     Node::Var { data: "f".to_string() },
                     Node::Var { data: "g".to_string() },
                     Node::Compose { left: NodeId(1), right: NodeId(0) }
-                ]
+                ],
+                positions: vec![0, 5, 2]
             }
         );
     }
 
     #[test]
     fn test_parse_double_compose() {
-        let input = r"
-            f << g << h
-        ";
+        let input = r"f << g << h";
         let (_root, ast ) = parse_str(input).unwrap();
 
         assert_eq!(
@@ -3785,16 +4003,15 @@ mod tests {
                     Node::Var { data: "h".to_string() },
                     Node::Compose { left: NodeId(2), right: NodeId(1) },
                     Node::Compose { left: NodeId(3), right: NodeId(0) }
-                ]
+                ],
+                positions: vec![0, 5, 10, 7, 2]
             }
         );
     }
 
     #[test]
     fn test_parse_and_tighter_than_or() {
-        let input = r"
-            x || y && z
-        ";
+        let input = r"x || y && z";
         let (_root, ast ) = parse_str(input).unwrap();
 
         assert_eq!(
@@ -3807,15 +4024,14 @@ mod tests {
                     Node::And { left: NodeId(1), right: NodeId(2) },
                     Node::Or { left: NodeId(0), right: NodeId(3) }
                 ]
+                ,positions: vec![0,5,10,7,2]
             }
         );
     }
 
     #[test]
     fn test_parse_list_spread() {
-        let input = r"
-            [1, ... ]
-        ";
+        let input = r"[1, ... ]";
         let (_root, ast ) = parse_str(input).unwrap();
 
         assert_eq!(
@@ -3825,7 +4041,8 @@ mod tests {
                     Node::Int { data: 1 },
                     Node::Spread { name: None },
                     Node::List { data: vec![ NodeId(0), NodeId(1) ]}
-                ]
+                ],
+                positions: vec![1, 4, 0]
             }
         );
     }
@@ -3847,9 +4064,7 @@ mod tests {
 
     #[test]
     fn test_parse_list_with_non_name_expr_after_spread_raises_parse_err() {
-        let input = r"
-            {x=1, ...}
-        ";
+        let input = r"{x=1, ...}";
 
         let (root, ast) = parse_str(input).unwrap();
         let _ = ast.dump_dot(root, "/tmp/dump");
@@ -3863,7 +4078,8 @@ mod tests {
                     Node::Assign { left: NodeId(0), right: NodeId(1) },
                     Node::Spread { name: None },
                     Node::Record { keys: vec![NodeId(0)], values: vec![NodeId(1)] }
-                ]
+                ],
+                positions: vec![1, 3, 2, 6, 0]
             }
         );
 
@@ -3962,7 +4178,6 @@ mod tests {
     #[test]
     fn test_parse_symbol() {
         let input = r"#abc";
-
         let (_root, ast) = parse_str(input).unwrap();
 
         assert_eq!(
@@ -3970,9 +4185,196 @@ mod tests {
             SyntaxTree {
                 nodes: vec![
                     Node::Symbol { data: "abc".to_string() },
-                ]
+                ],
+                positions: vec![0]
             }
         );
 
+    }
+
+    /////////////////////////////////////////////////////////////////
+    // Eval tests
+    /////////////////////////////////////////////////////////////////
+    
+    macro_rules! impl_eval_test {
+        ($input:literal, $res:expr) => {
+            let input = $input;
+            let (root, ast) = parse_str(input).unwrap();
+            let mut env = HashMap::new();
+            let result = eval(&mut env, &ast, root).unwrap();
+            assert_eq!(result, $res);
+        }
+    }
+
+    macro_rules! impl_err_test {
+        ($input:literal, $res:expr) => {
+            let input = $input;
+            let (root, ast) = parse_str(input).unwrap();
+            let mut env = HashMap::new();
+            let result = eval(&mut env, &ast, root).err().unwrap();
+            assert_eq!(result, $res);
+        }
+    }
+
+    #[test]
+    fn test_eval_int() {
+        impl_eval_test!("1", 1.into());
+    }
+
+    #[test]
+    fn test_eval_float() {
+        impl_eval_test!("2.21", 2.21.into());
+    }
+
+    #[test]
+    fn test_eval_add() {
+        impl_eval_test!("1+2", 3.into());
+    }
+
+    #[test]
+    fn test_eval_nested_add() {
+        impl_eval_test!("1+2+3", 6.into());
+    }
+
+    #[test]
+    fn test_eval_nested_add_float() {
+        impl_eval_test!("-1.1+2.2+3.3-1.0", 3.4.into());
+    }
+
+    #[test]
+    fn test_eval_variable() {
+        let input = "a=3";
+        let (root, ast) = parse_str(input).unwrap();
+        let mut env = HashMap::new();
+        let result = eval(&mut env, &ast, root).unwrap();
+        assert_eq!( result, Node::Assign { left: NodeId(0), right: NodeId(1) } );
+
+        let mut check = HashMap::new();
+        check.insert("a".to_string(), NodeId(1));
+        assert_eq!( env, check);
+    }
+
+    #[test]
+    fn test_eval_add_string() {
+        impl_err_test!("1 + hello",
+            (EvalError::InvalidNodeTypes(Node::Add { left: NodeId(0), right: NodeId(1) }), 2)
+        );
+    }
+
+    #[test]
+    fn test_eval_sub() {
+        impl_eval_test!("1 - 2", (-1).into());
+    }
+
+    #[test]
+    fn test_eval_sub_string() {
+        impl_err_test!("1 - hello",
+            (EvalError::InvalidNodeTypes(Node::Sub { left: NodeId(0), right: NodeId(1) }), 2));
+    }
+
+    #[test]
+    fn test_eval_mul() {
+        impl_eval_test!("3 * 2", 6.into());
+    }
+
+    #[test]
+    fn test_eval_mul_float() {
+        impl_eval_test!("3.1 * 1.0", 3.1.into());
+    }
+
+    #[test]
+    fn test_eval_mul_string() {
+        impl_err_test!("1 * hello",
+            (EvalError::InvalidNodeTypes(Node::Mul { left: NodeId(0), right: NodeId(1) }), 2)
+        );
+    }
+
+    #[test]
+    fn test_eval_div() {
+        impl_eval_test!("8 / 2", 4.into());
+    }
+
+    #[test]
+    fn test_eval_floor_div() {
+        impl_eval_test!("8.4 // 2.0", 4.0.into());
+    }
+
+    #[test]
+    fn test_eval_exp() {
+        impl_eval_test!("2 ^ 3", 8.into());
+    }
+
+    #[test]
+    fn test_eval_exp_floor() {
+        impl_eval_test!("2.0 ^ 3.0", 8.0.into());
+    }
+
+    #[test]
+    fn test_eval_exp_floor_int_vs_float() {
+        impl_err_test!("2.0 ^ 3",
+            (EvalError::InvalidNodeTypes(Node::Exp { left: NodeId(0), right: NodeId(1) }), 4)
+        );
+    }
+
+    #[test]
+    fn test_eval_mod() {
+        impl_eval_test!("8 % 3", 2.into());
+    }
+
+    #[test]
+    fn test_eval_mod_floor() {
+        impl_eval_test!("8.0 % 2.5", 0.5.into());
+    }
+
+    #[test]
+    fn test_eval_mod_floor_int_vs_float() {
+        impl_err_test!("8 % 2.0",
+            (EvalError::InvalidNodeTypes(Node::Mod { left: NodeId(0), right: NodeId(1) }), 2)
+        );
+    }
+
+    #[test]
+    fn test_eval_equal_int_true() {
+        impl_eval_test!("8 == 3", Node::Symbol { data: "false".to_string() });
+    }
+
+    #[test]
+    fn test_eval_equal_int_false() {
+        impl_eval_test!("8 == 8", Node::Symbol { data: "true".to_string() });
+    }
+
+    #[test]
+    fn test_eval_equal_float_true() {
+        impl_eval_test!("8.0 == 8.0", Node::Symbol { data: "true".to_string() });
+    }
+
+    #[test]
+    fn test_eval_equal_float_false() {
+        impl_eval_test!("8.0 == 2.0", Node::Symbol { data: "false".to_string() });
+    }
+
+    #[test]
+    fn test_eval_equal_floor_int_vs_float() {
+        impl_err_test!("8 == 2.0",
+            (EvalError::InvalidNodeTypes(Node::Equal { left: NodeId(0), right: NodeId(1) }), 2)
+        );
+    }
+
+    #[test]
+    fn test_eval_equal_negative_float_false() {
+        impl_eval_test!("8.0 == -2.0", Node::Symbol { data: "false".to_string() });
+    }
+
+    #[test]
+    fn test_eval_equal_negative_float_true() {
+        impl_eval_test!("-8.0 == -8.0", Node::Symbol { data: "true".to_string() });
+    }
+
+    #[test]
+    fn test_eval_equal_float_true_tests() {
+        impl_eval_test!("0.0 == 0.0", Node::Symbol { data: "true".to_string() });
+        impl_eval_test!("0.00000001 == 0.0", Node::Symbol { data: "false".to_string() });
+        impl_eval_test!("0.00000000001 == 0.0", Node::Symbol { data: "false".to_string() });
+        impl_eval_test!("0.000000000000001 == 0.0", Node::Symbol { data: "true".to_string() });
     }
 }
