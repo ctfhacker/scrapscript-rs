@@ -238,6 +238,9 @@ pub enum Node {
     /// A float value (leaf)
     Float { data: f64 },
 
+    /// A string
+    String { data: String },
+
     /// A variable
     Var { data: String },
 
@@ -368,7 +371,7 @@ impl Node {
             Node::Record { .. } => {
                 "RECORD".to_string()
             }
-            Node::Var { data }  | Node::Symbol { data }=> data.to_string(),
+            Node::Var { data }  | Node::Symbol { data } | Node::String { data } => data.to_string(),
             Node::Bytes { data } => {
                 format!("{:?}", data.iter().map(|x| *x as char).collect::<Vec<_>>())
             }
@@ -584,6 +587,11 @@ pub fn is_valid_name_byte(c: u8) -> bool {
     matches!(c, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'$' | b'_' | b'\'')
 }
 
+#[must_use]
+pub fn is_not_double_quote(c: u8) -> bool {
+    matches!(c, b'"')
+}
+
 /// Returns `true` for a valid int character and `false` otherwise
 /// 
 /// Valid symbol characters
@@ -623,6 +631,7 @@ impl SyntaxTree {
     impl_data_node!(int, Int, i64);
     impl_data_node!(float, Float, f64);
     impl_data_node!(name, Var, String);
+    impl_data_node!(string, String, String);
     impl_data_node!(symbol, Symbol, String);
     impl_data_node!(bytes, Bytes, Vec<u8>);
     impl_data_node!(list, List, Vec<NodeId>);
@@ -813,6 +822,7 @@ impl SyntaxTree {
                 Node::Int { .. } 
                 | Node::Float { .. } 
                 | Node::Var { .. } 
+                | Node::String { .. } 
                 | Node::Symbol { .. } 
                 | Node::Bytes { .. } 
                 | Node::Hole 
@@ -855,7 +865,8 @@ impl SyntaxTree {
 pub enum EvalError {
     InvalidAssignmentVariable,
     InvalidNodeTypes(Node),
-    ExponentPowerTooLarge(i64)
+    ExponentPowerTooLarge(i64),
+    NonStringFoundInStringConcat(Node)
 }
 
 /// Evaluate the given node at `root` using the given context `ctx`
@@ -867,6 +878,7 @@ pub enum EvalError {
 /// # Panics
 /// 
 /// * An error position cannot fit in `usize`
+#[allow(clippy::too_many_lines)]
 pub fn eval<S: std::hash::BuildHasher>(
         ctx: &mut HashMap<String, NodeId, S>, 
         ast: &SyntaxTree, 
@@ -882,6 +894,7 @@ pub fn eval<S: std::hash::BuildHasher>(
         | Node::Exp { left, right }
         | Node::Mod { left, right }
         | Node::Equal { left, right }
+        | Node::NotEqual { left, right }
         => {
             let left_data = eval(ctx, ast, *left)?;
             let right_data = eval(ctx, ast, *right)?;
@@ -896,8 +909,15 @@ pub fn eval<S: std::hash::BuildHasher>(
                         Node::Sub { .. } =>  left_int - right_int ,
                         Node::Mul { .. } =>  left_int * right_int ,
                         Node::Mod { .. } =>  left_int % right_int ,
-                        Node::Equal { .. } => {
-                            if left_int == right_int {
+                        Node::Equal { .. } | Node::NotEqual { .. }=> {
+                            let mut result = left_int == right_int;
+
+                            // Invert the result for not equal
+                            if matches!(curr_node, Node::NotEqual { .. }) {
+                                result = !result;
+                            }
+
+                            if result {
                                 return Ok(Node::Symbol { data: "true".to_string()});
                             } 
                                 
@@ -935,19 +955,24 @@ pub fn eval<S: std::hash::BuildHasher>(
                         Node::Mod { .. } =>  left % right,
                         Node::Exp { .. } =>  left.powf(right),
                         Node::FloorDiv { .. } =>  (left / right).floor(),
-                        Node::Equal { .. } => {
+                        Node::NotEqual { .. } | Node::Equal { .. } => {
                             // 
                             let l_abs = left.abs();
                             let r_abs = right.abs();
                             let diff = (left - right).abs();
 
-                            let result = if (left - right).abs() < FLOAT_ERROR_MARGIN {
+                            let mut result = if (left - right).abs() < FLOAT_ERROR_MARGIN {
                                 true
                             } else if left == 0.0 || right == 0.0 || (l_abs + r_abs < f64::MIN_POSITIVE) {
                                 diff < f64::EPSILON * f64::MIN_POSITIVE
                             } else {
                                 diff / (l_abs + r_abs).min(f64::MAX) < f64::EPSILON
                             };
+
+                            // Invert the result for not equal
+                            if matches!(curr_node, Node::NotEqual { .. }) {
+                                result = !result;
+                            }
                                 
                             if result {
                                 return Ok(Node::Symbol { data: "true".to_string()});
@@ -974,7 +999,21 @@ pub fn eval<S: std::hash::BuildHasher>(
 
             Ok(curr_node.clone())
         }
-        Node::Int { .. } | Node::Float { .. } | Node::Var { .. } => {
+        Node::StrConcat { left, right } => {
+            let left_data = eval(ctx, ast, *left)?;
+            let right_data = eval(ctx, ast, *right)?;
+
+            dbg!(&left_data);
+            dbg!(&right_data);
+
+            let (Node::String { data: l_str }, Node::String { data: r_str}) = (left_data, right_data) else {
+                return Err((EvalError::NonStringFoundInStringConcat(curr_node.clone()), ast.positions[root.0]));
+            };
+
+            Ok(Node::String { data: l_str + &r_str })
+                                
+        }
+        Node::Int { .. } | Node::Float { .. } | Node::Var { .. } | Node::String { .. } => {
             // Base case.. Return the node as is. Nothing more to evaluate
             Ok(curr_node.clone())
         }
@@ -1365,8 +1404,9 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
 /// * Error occurs during parsing of tokens
 pub fn parse_str(input: &str) -> Result<(NodeId, SyntaxTree), Error> {
     let tokens = tokenize(input)?;
-    // dbg!(&tokens);
+     // dbg!(&tokens);
     let (node, ast) = parse(&tokens, input)?;
+     dbg!(&ast);
     ast.print_nodes(input);
 
     Ok((node, ast))
@@ -1497,6 +1537,11 @@ pub fn _parse(
                 continue_while!(is_valid_name_byte);
                 let name = input[input_index..=end_input_index].to_string();
                 ast.name(name, input_index.try_into().unwrap())
+            }
+            TokenId::String => {
+                continue_while!(is_not_double_quote);
+                let name = input[input_index + 1..end_input_index].to_string();
+                ast.string(name, input_index.try_into().unwrap())
             }
             TokenId::Symbol => {
                 continue_while!(is_valid_symbol_byte);
@@ -3223,7 +3268,7 @@ mod tests {
     #[test]
     fn test_parse_binary_op() {
         let ops = [
-            "+", "-", "*", "/", "^", "%", "==", "/=", "<", ">", "<=", ">=", "&&", "||", "++", ">+", "+<"
+            "+", "-", "*", "/", "^", "%", "==", "/=", "<", ">", "<=", ">=", "&&", "||", ">+", "+<"
         ];
 
         for op in ops {
@@ -3248,7 +3293,6 @@ mod tests {
                 ">=" => Node::GreaterEqual { left, right },
                 "&&" => Node::And { left, right }, 
                 "||" => Node::Or { left, right }, 
-                "++" => Node::StrConcat { left, right }, 
                 ">+" => Node::ListCons { left, right }, 
                 "+<" => Node::ListAppend { left, right },
                 _ => unreachable!()
@@ -3268,6 +3312,24 @@ mod tests {
                 }
             );
         }
+    }
+
+    #[test]
+    fn test_parse_str_concat() {
+        let input = "\"hello\" ++ \"world\"";
+        let (_root, ast) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::String { data: "hello".to_string() },
+                    Node::String { data: "world".to_string() },
+                    Node::StrConcat { left: NodeId(0), right: NodeId(1) },
+                ],
+                positions: vec![0, 11, 8]
+            }
+        );
     }
 
     #[test]
@@ -4336,21 +4398,25 @@ mod tests {
     #[test]
     fn test_eval_equal_int_true() {
         impl_eval_test!("8 == 3", Node::Symbol { data: "false".to_string() });
+        impl_eval_test!("8 /= 3", Node::Symbol { data: "true".to_string() });
     }
 
     #[test]
     fn test_eval_equal_int_false() {
         impl_eval_test!("8 == 8", Node::Symbol { data: "true".to_string() });
+        impl_eval_test!("8 /= 8", Node::Symbol { data: "false".to_string() });
     }
 
     #[test]
     fn test_eval_equal_float_true() {
         impl_eval_test!("8.0 == 8.0", Node::Symbol { data: "true".to_string() });
+        impl_eval_test!("8.0 /= 8.0", Node::Symbol { data: "false".to_string() });
     }
 
     #[test]
     fn test_eval_equal_float_false() {
         impl_eval_test!("8.0 == 2.0", Node::Symbol { data: "false".to_string() });
+        impl_eval_test!("8.0 /= 2.0", Node::Symbol { data: "true".to_string() });
     }
 
     #[test]
@@ -4358,16 +4424,21 @@ mod tests {
         impl_err_test!("8 == 2.0",
             (EvalError::InvalidNodeTypes(Node::Equal { left: NodeId(0), right: NodeId(1) }), 2)
         );
+        impl_err_test!("8 /= 2.0",
+            (EvalError::InvalidNodeTypes(Node::NotEqual { left: NodeId(0), right: NodeId(1) }), 2)
+        );
     }
 
     #[test]
     fn test_eval_equal_negative_float_false() {
         impl_eval_test!("8.0 == -2.0", Node::Symbol { data: "false".to_string() });
+        impl_eval_test!("8.0 /= -2.0", Node::Symbol { data: "true".to_string() });
     }
 
     #[test]
     fn test_eval_equal_negative_float_true() {
         impl_eval_test!("-8.0 == -8.0", Node::Symbol { data: "true".to_string() });
+        impl_eval_test!("-8.0 /= -8.0", Node::Symbol { data: "false".to_string() });
     }
 
     #[test]
@@ -4376,5 +4447,20 @@ mod tests {
         impl_eval_test!("0.00000001 == 0.0", Node::Symbol { data: "false".to_string() });
         impl_eval_test!("0.00000000001 == 0.0", Node::Symbol { data: "false".to_string() });
         impl_eval_test!("0.000000000000001 == 0.0", Node::Symbol { data: "true".to_string() });
+
+        impl_eval_test!("0.0 /= 0.0", Node::Symbol { data: "false".to_string() });
+        impl_eval_test!("0.00000001 /= 0.0", Node::Symbol { data: "true".to_string() });
+        impl_eval_test!("0.00000000001 /= 0.0", Node::Symbol { data: "true".to_string() });
+        impl_eval_test!("0.000000000000001 /= 0.0", Node::Symbol { data: "false".to_string() });
+    }
+
+    #[test]
+    fn test_eval_string_concat() {
+        impl_eval_test!("\"hello\" ++ \"world\"", Node::String { data: "helloworld".to_string() });
+    }
+
+    #[test]
+    fn test_eval_string_concat_error() {
+        impl_err_test!("\"hello\" ++ 1", (EvalError::NonStringFoundInStringConcat(Node::StrConcat { left: NodeId(0), right: NodeId(1) }), 8));
     }
 }
