@@ -468,6 +468,9 @@ pub enum ParseError {
 
     /// Parsed a non-leaf node as a first token
     NonLeafNodeFoundFirst,
+
+    /// Spread must come at the end of a record/list
+    SpreadMustComeAtEndOfCollection
 }
 
 macro_rules! impl_from_err {
@@ -1141,6 +1144,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
 /// * Error occurs during parsing of tokens
 pub fn parse_str(input: &str) -> Result<(NodeId, SyntaxTree), Error> {
     let tokens = tokenize(input)?;
+    // dbg!(&tokens);
     Ok(parse(&tokens, input)?)
 }
 
@@ -1207,25 +1211,40 @@ pub fn _parse(
             };
         }
 
+
+        dbg!(&start);
+
         // Parse the next leaf token
         let leaf = match start.id {
             TokenId::OpSpread => {
-                let next_token = tokens[*token_index];
+                let mut next_token = tokens[*token_index];
                 let mut spread_name = None;
                 match next_token.id {
-                    TokenId::RightBracket => {
+                    TokenId::RightBracket | TokenId::RightBrace => {
                         // Spread name will remain nameless
                     }
                     TokenId::Name => {
                         let input_index = next_token.pos as usize;
-                        let end_input_index = tokens[*token_index + 1].pos as usize - 1;
+                        let mut end_input_index = tokens[*token_index + 1].pos as usize - 1;
 
-                        continue_while!(b'a'..=b'z' | b'A'..=b'Z' | b'$' | b'\'' | b'_' | b'0'..=b'9');
+                        let input_bytes = input.as_bytes();
+
+                        // Skip over all whitespace. Reset the current token when hitting whitespace.
+                        while end_input_index > input_index && !matches!(input_bytes[end_input_index], b'a'..=b'z' | b'A'..=b'Z' | b'$' | b'\'' | b'_' | b'0'..=b'9')
+                        {
+                            end_input_index -= 1;
+                        }
+
                         spread_name = Some(input[input_index..=end_input_index].to_string());
 
                         *token_index += 1;
+                        next_token = tokens[*token_index];
                     }
-                    x => return Err((ParseError::UnknownToken(x), 0)),
+                    _ => return Err((ParseError::SpreadMustComeAtEndOfCollection, start.pos.try_into().unwrap())),
+                }
+
+                if !matches!(next_token.id, TokenId::RightBracket | TokenId::RightBrace) {
+                    return Err((ParseError::SpreadMustComeAtEndOfCollection, 1));
                 }
 
                 ast.spread(spread_name)
@@ -1352,6 +1371,7 @@ pub fn _parse(
                     while !matches!(tokens[*token_index].id, TokenId::RightBrace) {
                         println!("Next token in brace: {:?}", tokens[*token_index]);
                         let next_token = tokens[*token_index];
+                        dbg!(&next_token);
 
                         if matches!(next_token.id, TokenId::EndOfFile) {
                             *token_index += 1;
@@ -1370,12 +1390,18 @@ pub fn _parse(
                         let old_token_index = *token_index;
                         let token = _parse(tokens, token_index, input, ast, 20)?;
 
-                        if let  Node::Assign { left, right } = ast.nodes[token] {
-                            keys.push(left);
-                            values.push(right);
-                        } else {
-                                dbg!(&ast.nodes[token]);
+                        match &ast.nodes[token] {
+                            Node::Assign { left, right } => {
+                                keys.push(*left);
+                                values.push(*right);
+                            }
+                            Node::Spread { name: _ } => {
+                                
+                            }
+                            x => {
+                                dbg!(&x);
                                 return Err((ParseError::NonAssignmentInRecord(tokens[old_token_index].id), next_token.pos as usize));
+                            }
                         }
 
                         prev_token = next_token.id; 
@@ -1418,6 +1444,8 @@ pub fn _parse(
             }
             x => return Err((ParseError::UnknownToken(x), start.pos as usize)),
         };
+
+        dbg!(&leaf);
 
         Ok(leaf)
     };
@@ -3745,7 +3773,22 @@ mod tests {
     #[test]
     fn test_parse_list_with_non_name_expr_after_spread_raises_parse_error() {
         let input = r"
-            [1, ...rest]
+            [1, ...rest, 2]
+        ";
+
+        let output = parse_str(input);
+
+        assert!(matches!(
+            output,
+            Err(Error::Parse((ParseError::SpreadMustComeAtEndOfCollection, 1)))
+        ));
+
+    }
+
+    #[test]
+    fn test_parse_list_with_non_name_expr_after_spread_raises_parse_err() {
+        let input = r"
+            {x=1, ...}
         ";
 
         let (root, ast) = parse_str(input).unwrap();
@@ -3755,11 +3798,74 @@ mod tests {
             ast,
             SyntaxTree {
                 nodes: vec![
+                    Node::Var { data: "x".to_string() },
                     Node::Int { data: 1 },
-                    Node::Spread { name: Some("rest".to_string()) },
-                    Node::List { data: vec![ NodeId(0), NodeId(1) ]}
+                    Node::Assign { left: NodeId(0), right: NodeId(1) },
+                    Node::Spread { name: None },
+                    Node::Record { keys: vec![NodeId(0)], values: vec![NodeId(1)] }
                 ]
             }
         );
+
+    }
+
+    #[test]
+    fn test_parse_record_spread_beginning_raises_parse_error() {
+        let input = r"{..., 1, 2, 3}";
+
+        let output = parse_str(input);
+
+        dbg!(&output);
+
+        assert!(matches!(
+            output,
+            Err(Error::Parse((ParseError::SpreadMustComeAtEndOfCollection, 1)))
+        ));
+
+    }
+
+    #[test]
+    fn test_parse_list_spread_beginning_raises_parse_error() {
+        let input = r"[..., 1, 2, 3]";
+
+        let output = parse_str(input);
+
+        dbg!(&output);
+
+        assert!(matches!(
+            output,
+            Err(Error::Parse((ParseError::SpreadMustComeAtEndOfCollection, 1)))
+        ));
+
+    }
+
+    #[test]
+    fn test_parse_list_spread_middle_raises_parse_error() {
+        let input = r"[1, 2, ..., 3]";
+
+        let output = parse_str(input);
+
+        dbg!(&output);
+
+        assert!(matches!(
+            output,
+            Err(Error::Parse((ParseError::SpreadMustComeAtEndOfCollection, 7)))
+        ));
+
+    }
+
+    #[test]
+    fn test_parse_record_spread_middle_raises_parse_error() {
+        let input = r"{x=1, ..., y=2}";
+
+        let output = parse_str(input);
+
+        dbg!(&output);
+
+        assert!(matches!(
+            output,
+            Err(Error::Parse((ParseError::SpreadMustComeAtEndOfCollection, 6)))
+        ));
+
     }
 }
