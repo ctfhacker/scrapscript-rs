@@ -237,6 +237,9 @@ pub enum Node {
     /// A variable
     Var { data: String },
 
+    /// A symbol name
+    Symbol{ data: String },
+
     /// A vec of bytes
     Bytes { data: Vec<u8> },
 
@@ -346,7 +349,7 @@ impl Node {
             Node::Record { .. } => {
                 "RECORD".to_string()
             }
-            Node::Var { data } => data.to_string(),
+            Node::Var { data }  | Node::Symbol { data }=> data.to_string(),
             Node::Bytes { data } => {
                 format!("{:?}", data.iter().map(|x| *x as char).collect::<Vec<_>>())
             }
@@ -452,7 +455,7 @@ pub enum ParseError {
     /// Comma in list found before another valid token.
     /// Ex: [,] or [,,]
     ListCommaBeforeToken,
-    RecordCommaBeforeToken,
+    RecordCommaBeforeAssignment,
 
     /// Left side of an assignment was not a variable
     NonVariableInAssignment,
@@ -545,10 +548,66 @@ macro_rules! impl_left_right_node {
     };
 }
 
+/// Returns `true` for a valid symbol character and `false` otherwise
+/// 
+/// Valid symbol characters
+///
+/// 'a'..='z' | 'A'..='Z' | '$' | '_' | '\''
+#[must_use]
+pub fn is_valid_symbol_byte(c: u8) -> bool {
+    matches!(c, b'a'..=b'z' | b'A'..=b'Z' | b'$' | b'_' | b'\'')
+}
+
+/// Returns `true` for a valid name character and `false` otherwise
+/// 
+/// Valid symbol characters
+///
+/// 'a'..='z' | 'A'..='Z' | '0'..='9' | '$' | '_' | '\''
+#[must_use]
+pub fn is_valid_name_byte(c: u8) -> bool {
+    matches!(c, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'$' | b'_' | b'\'')
+}
+
+/// Returns `true` for a valid int character and `false` otherwise
+/// 
+/// Valid symbol characters
+///
+/// '0'..='9'
+#[must_use]
+pub fn is_valid_int_byte(c: u8) -> bool {
+    c.is_ascii_digit()
+}
+
+/// Returns `true` for a valid float character and `false` otherwise
+/// 
+/// Valid symbol characters
+///
+/// '0'..='9'
+#[must_use]
+pub fn is_valid_float_byte(c: u8) -> bool {
+    matches!(c, b'0'..=b'9' | b'.')
+}
+
+/// Returns `true` for a valid base85 character and `false` otherwise
+#[must_use]
+pub fn is_valid_base85_byte(c: u8) -> bool {
+    matches!(c, b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | 
+        b'!' | b'#' | b'$' | b'%' | b'&' | b'(' | b')' | b'*' | 
+        b'+' | b'-' | b';' | b'<' | b'=' | b'>' | b'?' | b'@' | 
+        b'^' | b'_' | b'`' | b'{' | b'|' | b'}' | b'~' | b'"')
+}
+
+/// Returns `true` for a valid base64 character and `false` otherwise
+#[must_use]
+pub fn is_valid_base64_byte(c: u8) -> bool {
+    matches!(c, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'=')
+}
+
 impl SyntaxTree {
     impl_data_node!(int, Int, i64);
     impl_data_node!(float, Float, f64);
     impl_data_node!(name, Var, String);
+    impl_data_node!(symbol, Symbol, String);
     impl_data_node!(bytes, Bytes, Vec<u8>);
     impl_data_node!(list, List, Vec<NodeId>);
     impl_left_right_node!(sub, Sub);
@@ -747,6 +806,7 @@ impl SyntaxTree {
                 Node::Int { .. } 
                 | Node::Float { .. } 
                 | Node::Var { .. } 
+                | Node::Symbol { .. } 
                 | Node::Bytes { .. } 
                 | Node::Hole 
                 | Node::Spread  { .. }
@@ -1044,7 +1104,7 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
                 set_token!(Symbol, 0);
 
                 // Skip over all characters allowed in a name
-                while matches!(input[index], b'a'..=b'z' | b'A'..=b'Z' | b'$' | b'_' | b'\'') {
+                while is_valid_symbol_byte(input[index]) {
                     index += 1;
                     is_empty = false;
 
@@ -1200,12 +1260,11 @@ pub fn _parse(
         let mut end_input_index = tokens[*token_index].pos as usize - 1;
 
         macro_rules! continue_while {
-            ($pat:pat) => {
+            ($check_func:ident) => {
                 let input_bytes = input.as_bytes();
 
                 // Skip over all whitespace. Reset the current token when hitting whitespace.
-                while end_input_index > input_index && !matches!(input_bytes[end_input_index], $pat)
-                {
+                while end_input_index > input_index && !$check_func(input_bytes[end_input_index]) {
                     end_input_index -= 1;
                 }
             };
@@ -1230,8 +1289,7 @@ pub fn _parse(
                         let input_bytes = input.as_bytes();
 
                         // Skip over all whitespace. Reset the current token when hitting whitespace.
-                        while end_input_index > input_index && !matches!(input_bytes[end_input_index], b'a'..=b'z' | b'A'..=b'Z' | b'$' | b'\'' | b'_' | b'0'..=b'9')
-                        {
+                        while end_input_index > input_index && !is_valid_name_byte(input_bytes[end_input_index]) {
                             end_input_index -= 1;
                         }
 
@@ -1250,7 +1308,7 @@ pub fn _parse(
                 ast.spread(spread_name)
             }
             TokenId::Int => {
-                continue_while!(b'0'..=b'9');
+                continue_while!(is_valid_int_byte);
 
                 let value = input[input_index..=end_input_index]
                     .parse()
@@ -1260,7 +1318,7 @@ pub fn _parse(
                 ast.int(value)
             }
             TokenId::Float => {
-                continue_while!(b'0'..=b'9' | b'.');
+                continue_while!(is_valid_float_byte);
 
                 let value = input[input_index..=end_input_index]
                     .parse()
@@ -1277,15 +1335,17 @@ pub fn _parse(
                 ast.sub(zero_int, right)
             }
             TokenId::Name => {
-                continue_while!(b'a'..=b'z' | b'A'..=b'Z' | b'$' | b'\'' | b'_' | b'0'..=b'9');
+                continue_while!(is_valid_name_byte);
                 let name = input[input_index..=end_input_index].to_string();
                 ast.name(name)
             }
+            TokenId::Symbol => {
+                continue_while!(is_valid_symbol_byte);
+                let name = input[input_index..=end_input_index].to_string();
+                ast.symbol(name)
+            }
             TokenId::Base85 => {
-                continue_while!(b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | 
-                    b'!' | b'#' | b'$' | b'%' | b'&' | b'(' | b')' | b'*' | 
-                    b'+' | b'-' | b';' | b'<' | b'=' | b'>' | b'?' | b'@' | 
-                    b'^' | b'_' | b'`' | b'{' | b'|' | b'}' | b'~' | b'"');
+                continue_while!(is_valid_base85_byte);
                 let name = &input[input_index..=end_input_index];
 
                 let bytes = base85::decode(name)
@@ -1296,7 +1356,7 @@ pub fn _parse(
                 use base64::Engine;
 
                 let name = &input[input_index..=end_input_index];
-                continue_while!(b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'=');
+                continue_while!(is_valid_base64_byte);
 
                 // Decode the base64 string
                 let bytes = base64::engine::general_purpose::STANDARD
@@ -1380,7 +1440,7 @@ pub fn _parse(
 
                         if matches!(next_token.id, TokenId::Comma) {
                             if matches!(prev_token, TokenId::LeftBrace | TokenId::Comma) {
-                                return Err((ParseError::RecordCommaBeforeToken, next_token.pos as usize));
+                                return Err((ParseError::RecordCommaBeforeAssignment, next_token.pos as usize));
                             }
 
                             *token_index += 1;
@@ -3866,6 +3926,53 @@ mod tests {
             output,
             Err(Error::Parse((ParseError::SpreadMustComeAtEndOfCollection, 6)))
         ));
+
+    }
+
+    #[test]
+    fn test_parse_record_with_only_comma_parse_error() {
+        let input = r"{,}";
+
+        let output = parse_str(input);
+
+        dbg!(&output);
+
+        assert!(matches!(
+            output,
+            Err(Error::Parse((ParseError::RecordCommaBeforeAssignment, 1)))
+        ));
+
+    }
+
+    #[test]
+    fn test_parse_record_with_two_comma_parse_error() {
+        let input = r"{,,}";
+
+        let output = parse_str(input);
+
+        dbg!(&output);
+
+        assert!(matches!(
+            output,
+            Err(Error::Parse((ParseError::RecordCommaBeforeAssignment, 1)))
+        ));
+
+    }
+
+    #[test]
+    fn test_parse_symbol() {
+        let input = r"#abc";
+
+        let (_root, ast) = parse_str(input).unwrap();
+
+        assert_eq!(
+            ast,
+            SyntaxTree {
+                nodes: vec![
+                    Node::Symbol { data: "abc".to_string() },
+                ]
+            }
+        );
 
     }
 }
