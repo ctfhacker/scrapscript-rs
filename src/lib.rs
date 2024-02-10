@@ -465,6 +465,7 @@ pub enum TokenError {
 
 #[derive(Debug)]
 pub enum ParseError {
+    InternalParseError,
     UnknownToken(TokenId),
     UnknownOperatorToken(TokenId),
     NoTokensGiven,
@@ -499,7 +500,10 @@ pub enum ParseError {
     SpreadMustComeAtEndOfCollection,
 
     /// Token other than Int or Float found during a subtraction
-    NonIntFloatForSubtract    
+    NonIntFloatForSubtract,
+
+    /// Different types found for the same list
+    ListTypeMismatch(TokenId, TokenId)
 }
 
 macro_rules! impl_from_err {
@@ -866,7 +870,8 @@ pub enum EvalError {
     InvalidAssignmentVariable,
     InvalidNodeTypes(Node),
     ExponentPowerTooLarge(i64),
-    NonStringFoundInStringConcat(Node)
+    NonStringFoundInStringConcat(Node),
+    ListTypeMismatch(Node),
 }
 
 /// Evaluate the given node at `root` using the given context `ctx`
@@ -884,6 +889,7 @@ pub fn eval<S: std::hash::BuildHasher>(
         ast: &SyntaxTree, 
         root: NodeId) -> Result<Node, (EvalError, u32)> {
     let curr_node = &ast.nodes[root];
+    let node_pos = ast.positions[root.0];
 
     match curr_node {
         Node::Add { left, right } 
@@ -1013,7 +1019,46 @@ pub fn eval<S: std::hash::BuildHasher>(
             Ok(Node::String { data: l_str + &r_str })
                                 
         }
-        Node::Int { .. } | Node::Float { .. } | Node::Var { .. } | Node::String { .. } => {
+        Node::ListCons { left, right } => {
+            let left_data = eval(ctx, ast, *left)?;
+            let right_data = eval(ctx, ast, *right)?;
+
+            // dbg!(&left_data);
+            // dbg!(&right_data);
+
+            let result = match (left_data, right_data) {
+                (Node::Int { .. }, Node::List { data: old_list }) 
+                => {
+                    for node in &old_list {
+                        if !matches!(ast.nodes[*node], Node::Int { .. }) {
+                            return Err((EvalError::ListTypeMismatch(ast.nodes[*node].clone()), node_pos));
+                        }
+                    }
+
+                    // Make the concat'd list
+                    let mut result = vec![*left];
+                    result.extend_from_slice(&old_list);
+                    result
+                }
+                (Node::List { data: old_list }, Node::Int { .. })  => {
+                    for node in &old_list {
+                        if !matches!(ast.nodes[*node], Node::Int { .. }) {
+                            return Err((EvalError::ListTypeMismatch(ast.nodes[*node].clone()), node_pos));
+                        }
+                    }
+
+                    // Make the concat'd list
+                    let mut result = old_list.clone();
+                    result.push(*right);
+                    result
+                }
+                _ => todo!()
+            };
+
+            Ok(Node::List { data: result })
+                                
+        }
+        Node::Int { .. } | Node::Float { .. } | Node::Var { .. } | Node::String { .. } | Node::List { .. } => {
             // Base case.. Return the node as is. Nothing more to evaluate
             Ok(curr_node.clone())
         }
@@ -1404,9 +1449,9 @@ pub fn tokenize(input: &str) -> Result<Vec<Token>, (TokenError, usize)> {
 /// * Error occurs during parsing of tokens
 pub fn parse_str(input: &str) -> Result<(NodeId, SyntaxTree), Error> {
     let tokens = tokenize(input)?;
-     // dbg!(&tokens);
+    // dbg!(&tokens);
     let (node, ast) = parse(&tokens, input)?;
-     dbg!(&ast);
+    // dbg!(&ast);
     ast.print_nodes(input);
 
     Ok((node, ast))
@@ -1582,8 +1627,8 @@ pub fn _parse(
                     // Otherwise, parse all the tokens in the list
 
                     while !matches!(tokens[*token_index].id, TokenId::RightBracket) {
-                        println!("Next token in bracket: {:?}", tokens[*token_index]);
                         let next_token = tokens[*token_index];
+                        println!("Next token in bracket: {next_token:?}");
 
                         if matches!(next_token.id, TokenId::EndOfFile) {
                             *token_index += 1;
@@ -1602,9 +1647,19 @@ pub fn _parse(
                         let token = _parse(tokens, token_index, input, ast, 20)?;
                         nodes.push(token);
 
+                        // dbg!(&ast.nodes[token]);
+
                         prev_token = next_token.id; 
+
+                        println!("Next token in bracket2: {:?}", tokens[*token_index].id);
                     }
-                    
+
+                    if !matches!(tokens[*token_index].id, TokenId::RightBracket) {
+                        return Err((ParseError::InternalParseError, tokens[*token_index].pos as usize));
+                    }
+
+                    // Skip over the parsed right bracket
+                    *token_index += 1;
                 }
 
                 ast.list(nodes, input_index.try_into().unwrap())
@@ -1714,6 +1769,8 @@ pub fn _parse(
 
     let mut left = parse_leaf(ast, token_index)?;
 
+    // dbg!(left, &ast.nodes[left]);
+
     loop {
         // Check if the left was modified
         let original = left;
@@ -1725,6 +1782,7 @@ pub fn _parse(
 
         if matches!(next.id, 
             TokenId::EndOfFile | TokenId::RightBracket | TokenId::RightBrace | TokenId::RightParen | TokenId::OpMatchCase) {
+            // dbg!(next.id);
             break;
         }
 
@@ -1748,7 +1806,6 @@ pub fn _parse(
                     println!("Hit EOF");
                     break;
                 }
-
                 TokenId::OpAdd => {
                     left = ast.add(left, right, binary_op.pos);
                 }
@@ -3268,7 +3325,7 @@ mod tests {
     #[test]
     fn test_parse_binary_op() {
         let ops = [
-            "+", "-", "*", "/", "^", "%", "==", "/=", "<", ">", "<=", ">=", "&&", "||", ">+", "+<"
+            "+", "-", "*", "/", "^", "%", "==", "/=", "<", ">", "<=", ">=", "&&", "||", "+<"
         ];
 
         for op in ops {
@@ -4260,20 +4317,28 @@ mod tests {
     
     macro_rules! impl_eval_test {
         ($input:literal, $res:expr) => {
-            let input = $input;
-            let (root, ast) = parse_str(input).unwrap();
+            let (root, ast) = parse_str($input).unwrap();
             let mut env = HashMap::new();
-            let result = eval(&mut env, &ast, root).unwrap();
+            let result = match eval(&mut env, &ast, root) {
+                Ok(result) => {
+                    result
+                }
+                err => {
+                    panic!("{err:?}");
+                    // Node::Hole
+                }
+            };
+
             assert_eq!(result, $res);
         }
     }
 
     macro_rules! impl_err_test {
         ($input:literal, $res:expr) => {
-            let input = $input;
-            let (root, ast) = parse_str(input).unwrap();
+            let (root, ast) = parse_str($input).unwrap();
             let mut env = HashMap::new();
             let result = eval(&mut env, &ast, root).err().unwrap();
+            dbg!(&result);
             assert_eq!(result, $res);
         }
     }
@@ -4460,7 +4525,28 @@ mod tests {
     }
 
     #[test]
+    fn test_eval_string_concat_with_space() {
+        impl_eval_test!("\"hello\" ++ \" \" ++ \"world\"", Node::String { data: "hello world".to_string() });
+    }
+
+    #[test]
     fn test_eval_string_concat_error() {
         impl_err_test!("\"hello\" ++ 1", (EvalError::NonStringFoundInStringConcat(Node::StrConcat { left: NodeId(0), right: NodeId(1) }), 8));
     }
+
+    #[test]
+    fn test_eval_string_concat_error2() {
+        impl_err_test!("1 ++ \"hello\"", (EvalError::NonStringFoundInStringConcat(Node::StrConcat { left: NodeId(0), right: NodeId(1) }), 2));
+    }
+
+    #[test]
+    fn test_eval_list_cons() {
+        impl_eval_test!("1 >+ [2, 3]", Node::List { data: vec![NodeId(0), NodeId(1), NodeId(2)] });
+    }
+
+    #[test]
+    fn test_eval_list_cons2() {
+        impl_eval_test!("[2, 3] >+ 1", Node::List { data: vec![NodeId(0), NodeId(1), NodeId(3)] });
+    }
+
 }
