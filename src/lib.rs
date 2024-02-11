@@ -79,7 +79,7 @@ pub enum TokenId {
     /// Operator >+ (List concat)
     OpListCons,
 
-    /// Operator >+ (List append)
+    /// Operator +< (List append)
     OpListAppend,
 
     /// Operator !
@@ -1068,6 +1068,35 @@ pub fn eval<S: std::hash::BuildHasher>(
 
             Ok(Node::List { data: result })
                                 
+        }
+        Node::ListAppend { left, right } => {
+            let left_data = eval(ctx, ast, *left)?;
+            let right_data = eval(ctx, ast, *right)?;
+
+            dbg!(&left_data);
+            dbg!(&right_data);
+
+            let result = match (left_data, right_data) {
+                (Node::List{ data: old_list }, Node::Int{ .. }) => {
+                    for node in &old_list {
+                        if !matches!(ast.nodes[*node], Node::Int { .. }) {
+                            return Err((EvalError::ListTypeMismatch(ast.nodes[*node].clone()), node_pos));
+                        }
+                    }
+
+                    // Make the concat'd list
+                    let mut result = vec![*left];
+                    result.extend_from_slice(&old_list);
+                    result
+                }
+                (Node::List { .. }, Node::List { .. })  => {
+                    vec![*left, *right]
+                }
+                (Node::List { .. }, Node::Int { .. } | Node::Float { .. })  => {
+                    return Err((EvalError::ListTypeMismatch(ast.nodes[*right].clone()), node_pos));
+                }
+                _ => todo!()
+            };
         }
         Node::Int { .. } | Node::Float { .. } | Node::Var { .. } | Node::String { .. } | Node::List { .. } => {
             // Base case.. Return the node as is. Nothing more to evaluate
@@ -4564,5 +4593,11 @@ mod tests {
     fn test_eval_list_cons3() {
         impl_eval_test!("[] >+ []", Node::List { data: vec![NodeId(0), NodeId(1)] });
     }
+
+    #[test]
+    fn test_eval_list_append() {
+        impl_eval_test!("[2, 3] +< 1", Node::List { data: vec![NodeId(0), NodeId(1)]});
+    }
+
 
 }
