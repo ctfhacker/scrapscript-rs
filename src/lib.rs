@@ -416,6 +416,12 @@ impl Node {
     }
 }
 
+pub enum Type {
+    Int,
+    Float,
+    String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Token {
     id: TokenId,
@@ -863,6 +869,18 @@ impl SyntaxTree {
         }
 
     }
+
+    #[must_use]
+    pub fn get_type(&self, node: &NodeId) -> Type {
+        match &self.nodes[*node] {
+            Node::Int { .. } => Type::Int,
+            Node::Float { .. } => Type::Float,
+            Node::String { .. } => Type::String,
+            x => unimplemented!("Unknown type for node: {x:?}"),
+            
+        }
+        
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -1027,8 +1045,7 @@ pub fn eval<S: std::hash::BuildHasher>(
             // dbg!(&right_data);
 
             let result = match (left_data, right_data) {
-                (Node::Int { .. }, Node::List { data: old_list }) 
-                => {
+                (Node::Int { .. }, Node::List { data: old_list }) => {
                     for node in &old_list {
                         if !matches!(ast.nodes[*node], Node::Int { .. }) {
                             return Err((EvalError::ListTypeMismatch(ast.nodes[*node].clone()), node_pos));
@@ -1040,17 +1057,11 @@ pub fn eval<S: std::hash::BuildHasher>(
                     result.extend_from_slice(&old_list);
                     result
                 }
-                (Node::List { data: old_list }, Node::Int { .. })  => {
-                    for node in &old_list {
-                        if !matches!(ast.nodes[*node], Node::Int { .. }) {
-                            return Err((EvalError::ListTypeMismatch(ast.nodes[*node].clone()), node_pos));
-                        }
-                    }
-
-                    // Make the concat'd list
-                    let mut result = old_list.clone();
-                    result.push(*right);
-                    result
+                (Node::List { .. }, Node::List { .. })  => {
+                    vec![*left, *right]
+                }
+                (Node::List { .. }, Node::Int { .. } | Node::Float { .. })  => {
+                    return Err((EvalError::ListTypeMismatch(ast.nodes[*right].clone()), node_pos));
                 }
                 _ => todo!()
             };
@@ -4546,7 +4557,12 @@ mod tests {
 
     #[test]
     fn test_eval_list_cons2() {
-        impl_eval_test!("[2, 3] >+ 1", Node::List { data: vec![NodeId(0), NodeId(1), NodeId(3)] });
+        impl_err_test!("[2, 3] >+ 1", (EvalError::ListTypeMismatch(Node::Int { data: 1}), 7));
+    }
+
+    #[test]
+    fn test_eval_list_cons3() {
+        impl_eval_test!("[] >+ []", Node::List { data: vec![NodeId(0), NodeId(1)] });
     }
 
 }
