@@ -827,8 +827,6 @@ impl SyntaxTree {
                         dot.push_str(&format!("{node_id}:f{i} -> {right}\n"));
                     }
                 }
-
-
                 Node::Int { .. } 
                 | Node::Float { .. } 
                 | Node::Var { .. } 
@@ -881,6 +879,11 @@ impl SyntaxTree {
         }
         
     }
+
+    /// Get a reference to a node in the [`SyntaxTree`]
+    pub fn get(&self, node: NodeId) -> &Node {
+        &self.nodes[node]
+    }
 }
 
 #[derive(Debug, PartialEq)]
@@ -890,6 +893,9 @@ pub enum EvalError {
     ExponentPowerTooLarge(i64),
     NonStringFoundInStringConcat(Node),
     ListTypeMismatch(Node),
+
+    /// The name of a function was not a `Var`
+    InvalidFunctionName
 }
 
 /// Evaluate the given node at `root` using the given context `ctx`
@@ -905,7 +911,7 @@ pub enum EvalError {
 pub fn eval<S: std::hash::BuildHasher>(
         ctx: &mut HashMap<String, NodeId, S>, 
         ast: &SyntaxTree, 
-        root: NodeId) -> Result<Node, (EvalError, u32)> {
+        root: NodeId) -> Result<NodeId, (EvalError, u32)> {
     let curr_node = &ast.nodes[root];
     let node_pos = ast.positions[root.0];
 
@@ -922,6 +928,9 @@ pub fn eval<S: std::hash::BuildHasher>(
         => {
             let left_data = eval(ctx, ast, *left)?;
             let right_data = eval(ctx, ast, *right)?;
+
+            let left_data = ast.get(left_data);
+            let right_data = ast.get(right_data);
 
             dbg!(&left_data);
             dbg!(&right_data);
@@ -941,16 +950,18 @@ pub fn eval<S: std::hash::BuildHasher>(
                                 result = !result;
                             }
 
-                            if result {
-                                return Ok(Node::Symbol { data: "true".to_string()});
-                            } 
+                            let symbol = if result {
+                                "true".to_string()
+                            } else {
+                                "false".to_string()
+                            };
                                 
-                            return Ok(Node::Symbol { data: "false".to_string()});
+                            return Ok(ast.symbol(symbol, node_pos));
                         }
                         Node::Div { .. } | Node::FloorDiv { .. } =>  left_int / right_int,
                         Node::Exp { .. } =>  {
-                            let Ok(right) = right_int.try_into() else {
-                                return Err((EvalError::ExponentPowerTooLarge(right_int), ast.positions[right.0]));
+                            let Ok(right) = (*right_int).try_into() else {
+                                return Err((EvalError::ExponentPowerTooLarge(*right_int), ast.positions[right.0]));
                             };
 
                             dbg!(left_int);
@@ -960,16 +971,18 @@ pub fn eval<S: std::hash::BuildHasher>(
                         _ => unreachable!("{curr_node:?}")
                     };
 
-                    Ok(Node:: Int { data })
+                    Ok(ast.int(data, node_pos))
                 }
                 (left @ (Node::Float { .. } | Node::Int { data: 0}), Node::Float { data: right }) => {
                     // A negative float is represented by a `0 - floatnum`. We need 
                     // to convert this zero to a floating point zero
                     let left = match left {
-                        Node::Float { data} => data,
+                        Node::Float { data} => *data,
                         Node::Int { data: 0 } => 0.0,
                         _ => unreachable!()
                     };
+
+                    let right  = *right;
 
                     let data = match curr_node {
                         Node::Add { .. } =>  left + right,
@@ -997,17 +1010,20 @@ pub fn eval<S: std::hash::BuildHasher>(
                             if matches!(curr_node, Node::NotEqual { .. }) {
                                 result = !result;
                             }
-                                
-                            if result {
-                                return Ok(Node::Symbol { data: "true".to_string()});
-                            }
 
-                            return Ok(Node::Symbol { data: "false".to_string()});
+                            let symbol = if result {
+                                "true".to_string()
+                            } else {
+                                "false".to_string()
+                            };
+                                
+                            return Ok(ast.symbol(symbol, node_pos));
                         }
                         _ => unreachable!("{curr_node:?}")
                     };
 
-                    Ok(Node::Float { data })
+
+                    Ok(ast.float(data, node_pos))
                 }
                 _ => {
                     Err((EvalError::InvalidNodeTypes(curr_node.clone()), ast.positions[root.0]))
@@ -1021,11 +1037,27 @@ pub fn eval<S: std::hash::BuildHasher>(
 
             ctx.insert(var.to_string(), *right);
 
-            Ok(curr_node.clone())
+            Ok(root)
+        }
+        Node::Function { name, body} => {
+            let Node::Var { data: ref var} = ast.nodes[*name] else {
+                return Err((EvalError::InvalidFunctionName, ast.positions[name.0]));
+            };
+
+            let name_data = eval(ctx, ast, *name)?;
+            let body_data = eval(ctx, ast, *body)?;
+
+            dbg!(&name_data);
+            dbg!(&body_data);
+
+            todo!();
         }
         Node::StrConcat { left, right } => {
             let left_data = eval(ctx, ast, *left)?;
             let right_data = eval(ctx, ast, *right)?;
+
+            let left_data = ast.get(left_data);
+            let right_data = ast.get(right_data);
 
             dbg!(&left_data);
             dbg!(&right_data);
@@ -1034,71 +1066,47 @@ pub fn eval<S: std::hash::BuildHasher>(
                 return Err((EvalError::NonStringFoundInStringConcat(curr_node.clone()), ast.positions[root.0]));
             };
 
-            Ok(Node::String { data: l_str + &r_str })
-                                
+            let data = *l_str + r_str;
+            Ok(ast.string(data, node_pos))
         }
         Node::ListCons { left, right } => {
             let left_data = eval(ctx, ast, *left)?;
             let right_data = eval(ctx, ast, *right)?;
 
-            // dbg!(&left_data);
-            // dbg!(&right_data);
+            let left_data = ast.get(left_data);
+            let right_data = ast.get(right_data);
 
-            let result = match (left_data, right_data) {
-                (Node::Int { .. }, Node::List { data: old_list }) => {
-                    for node in &old_list {
-                        if !matches!(ast.nodes[*node], Node::Int { .. }) {
-                            return Err((EvalError::ListTypeMismatch(ast.nodes[*node].clone()), node_pos));
-                        }
-                    }
-
-                    // Make the concat'd list
-                    let mut result = vec![*left];
-                    result.extend_from_slice(&old_list);
-                    result
-                }
-                (Node::List { .. }, Node::List { .. })  => {
-                    vec![*left, *right]
-                }
-                (Node::List { .. }, Node::Int { .. } | Node::Float { .. })  => {
-                    return Err((EvalError::ListTypeMismatch(ast.nodes[*right].clone()), node_pos));
-                }
-                _ => todo!()
-            };
-
-            Ok(Node::List { data: result })
-                                
+            if let Node::List { data } = right_data {
+                Ok(ast.list(vec![*left, *right], node_pos))
+            } else {
+                Err((EvalError::ListTypeMismatch(*right_data), node_pos))
+            }
         }
         Node::ListAppend { left, right } => {
             let left_data = eval(ctx, ast, *left)?;
             let right_data = eval(ctx, ast, *right)?;
 
+            if let Node::List { mut data } = left_data {
+                data.push(right_data);
+                return Ok(Node::List { data });
+            }
+
+
             dbg!(&left_data);
             dbg!(&right_data);
-
-            let result = match (left_data, right_data) {
-                (Node::List{ data: old_list }, Node::Int{ .. }) => {
-                    for node in &old_list {
-                        if !matches!(ast.nodes[*node], Node::Int { .. }) {
-                            return Err((EvalError::ListTypeMismatch(ast.nodes[*node].clone()), node_pos));
-                        }
-                    }
-
-                    // Make the concat'd list
-                    let mut result = vec![*left];
-                    result.extend_from_slice(&old_list);
-                    result
-                }
-                (Node::List { .. }, Node::List { .. })  => {
-                    vec![*left, *right]
-                }
-                (Node::List { .. }, Node::Int { .. } | Node::Float { .. })  => {
-                    return Err((EvalError::ListTypeMismatch(ast.nodes[*right].clone()), node_pos));
-                }
-                _ => todo!()
-            };
+            todo!()
         }
-        Node::Int { .. } | Node::Float { .. } | Node::Var { .. } | Node::String { .. } | Node::List { .. } => {
+        Node::List { data } => {
+            let mut results = Vec::new();
+            for elem in data {
+                let new_data = eval(ctx, ast, *elem)?;
+                results.push(new_data);
+            }
+
+            Ok(Node::EvalList { data: results })
+
+        }
+        Node::Int { .. } | Node::Float { .. } | Node::Var { .. } | Node::String { .. } => {
             // Base case.. Return the node as is. Nothing more to evaluate
             Ok(curr_node.clone())
         }
@@ -4357,9 +4365,14 @@ mod tests {
     
     macro_rules! impl_eval_test {
         ($input:literal, $res:expr) => {
+            impl_eval_test_with_env!($input, HashMap::new(), $res)
+        }
+    }
+
+    macro_rules! impl_eval_test_with_env {
+        ($input:literal, $env:expr, $res:expr) => {
             let (root, ast) = parse_str($input).unwrap();
-            let mut env = HashMap::new();
-            let result = match eval(&mut env, &ast, root) {
+            let result = match eval(&mut $env, &ast, root) {
                 Ok(result) => {
                     result
                 }
@@ -4369,7 +4382,14 @@ mod tests {
                 }
             };
 
+            println!("--- AST ---");
+            for (i, node) in ast.nodes.iter().enumerate() {
+                println!("{i}: {node:?}");
+                
+            }
+
             assert_eq!(result, $res);
+            // ast.dump_dot(result, "/tmp/dump");
         }
     }
 
@@ -4581,7 +4601,16 @@ mod tests {
 
     #[test]
     fn test_eval_list_cons() {
-        impl_eval_test!("1 >+ [2, 3]", Node::List { data: vec![NodeId(0), NodeId(1), NodeId(2)] });
+        impl_eval_test!("1 >+ [2, 3]", 
+            Node::EvalList { 
+                data: vec![
+                    Node::Int { data: 1 },
+                    Node::EvalList { data: vec! [
+                        Node::Int { data: 2 },
+                        Node::Int { data: 3 },
+                    ]}
+                ] 
+            });
     }
 
     #[test]
@@ -4591,13 +4620,84 @@ mod tests {
 
     #[test]
     fn test_eval_list_cons3() {
-        impl_eval_test!("[] >+ []", Node::List { data: vec![NodeId(0), NodeId(1)] });
+        impl_eval_test!("[] >+ []", 
+            Node::EvalList { 
+                data: vec![
+                    Node::EvalList { data: vec![] },
+                    Node::EvalList { data: vec![] },
+                ]
+            });
     }
 
     #[test]
     fn test_eval_list_append() {
-        impl_eval_test!("[2, 3] +< 1", Node::List { data: vec![NodeId(0), NodeId(1)]});
+        impl_eval_test!("[1, 2] +< 3", 
+            Node::EvalList { 
+                data: vec![
+                    Node::Int { data: 1 }, 
+                    Node::Int { data: 2 }, 
+                    Node::Int { data: 3 } 
+                ]
+            });
     }
 
+    #[test]
+    fn test_eval_list_append_evaluate_elements() {
+        impl_eval_test!("[1 + 2, 3 + 4]", 
+            Node::EvalList { 
+                data: vec![
+                    Node::Int { data: 3 },
+                    Node::Int { data: 7 }
+                ]});
+    }
 
+    #[test]
+    fn test_eval_with_list_evaluates_elements() {
+        impl_eval_test!(
+            "[1 + 2, 3 + 4]", 
+            Node::EvalList { 
+                data: vec![
+                    Node::Int { data: 3 },
+                    Node::Int { data: 7 }
+                ]}
+        );
+    }
+
+    #[test]
+    fn test_eval_with_function_returns_closure_with_improved_env() {
+        let input = "x -> x";
+        let (root, mut ast) = parse_str(input).unwrap();
+
+        let new_env = [
+            ("a".to_string(), Node::Int { data: 1 }),
+            ("b".to_string(), Node::Int { data: 2 }),
+        ];
+
+        let mut env = HashMap::new();
+        for (name, node) in new_env {
+            let node_id = NodeId(ast.nodes.len());
+            ast.nodes.push(node);
+            env.insert(name, node_id);
+        }
+            
+
+        let result = match eval(&mut env, &ast, root) {
+            Ok(result) => {
+                result
+            }
+            err => {
+                panic!("{err:?}");
+                // Node::Hole
+            }
+        };
+
+        println!("--- AST ---");
+        for (i, node) in ast.nodes.iter().enumerate() {
+            println!("{i}: {node:?}");
+            
+        }
+
+        assert_eq!(result, Node::Hole);
+        // ast.dump_dot(result, "/tmp/dump");
+    }
 }
