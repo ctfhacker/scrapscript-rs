@@ -399,7 +399,7 @@ impl Node {
             Node::StrConcat { .. } => "++ (STR_CONCAT)".to_string(),
             Node::ListCons { .. } => ">+ (LIST_CONS)".to_string(),
             Node::Assign { .. } => "= (ASSIGN)".to_string(),
-            Node::Function { .. } => "-> (FUNCTION)".to_string(),
+            Node::Function { .. } => "FUNCTION".to_string(),
             Node::Where { .. } => ". (WHERE)".to_string(),
             Node::Assert { .. } => "? (ASSERT)".to_string(),
             Node::HasType { .. } => ": (HAS_TYPE)".to_string(),
@@ -853,6 +853,17 @@ impl SyntaxTree {
                         queue.push(right);
                         dot.push_str(&format!("{node_id}:f{i} -> {right}\n"));
                     }
+                }
+                Node::Closure { env, expr } => {
+                    dbg!(&env);
+                    queue.push(*expr);
+
+                    let label = env.iter()
+                        .map(|(key, node_id)| format!("{}={}", key, self.nodes[*node_id].label()))
+                        .collect::<String>();
+
+                    dot.push_str(&format!("node [shape=record]; {node_id} [ label = \"CLOSURE\nEnv:\n{label}\" ];\n"));
+                    dot.push_str(&format!("{node_id} -> {expr}  [ label=\"expr\"; ];\n"));
                 }
                 Node::Int { .. } 
                 | Node::Float { .. } 
@@ -2070,10 +2081,42 @@ pub fn _parse(
     Ok(left)
 }
 
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use TokenId::*;
+
+    fn impl_eval_test_with_env(
+            input: &'static str, 
+            init_env: Vec<(std::string::String, NodeId)>, 
+            wanted_result: Node, 
+            result_env: Vec<(std::string::String, NodeId)>) {
+        let (root, mut ast) = parse_str(input).unwrap();
+
+        let mut env: HashMap<std::string::String, NodeId> = HashMap::new();
+        for (key, value) in init_env.iter() {
+            env.insert(key.to_string(), *value);
+        }
+
+        let curr_result = eval(&mut env, &mut ast, root).ok().unwrap();
+
+        println!("--- AST ---");
+        for (i, node) in ast.nodes.iter().enumerate() {
+            println!("{i}: {node:?}");
+        
+        }
+
+        let curr_result = ast.nodes[curr_result].clone();
+        assert_eq!(curr_result, wanted_result);
+
+        let mut res_env = HashMap::new();
+        for (key, value) in result_env.iter() {
+            res_env.insert(key.to_string(), *value);
+        }
+        assert_eq!(env, res_env);
+        // ast.dump_dot(result, "/tmp/dump");
+    }
 
     #[test]
     fn test_tokenize_digit() {
@@ -4327,8 +4370,8 @@ mod tests {
     fn test_parse_list_with_non_name_expr_after_spread_raises_parse_err() {
         let input = r"{x=1, ...}";
 
-        let (root, ast) = parse_str(input).unwrap();
-        let _ = ast.dump_dot(root, "/tmp/dump");
+        let (_root, ast) = parse_str(input).unwrap();
+        // let _ = ast.dump_dot(root, "/tmp/dump");
 
         assert_eq!(
             ast,
@@ -4459,35 +4502,17 @@ mod tests {
     
     macro_rules! impl_eval_test {
         ($input:literal, $res:expr) => {
-            let mut env = HashMap::new();
-            impl_eval_test_with_env!($input, env, $res)
+            let env = vec![];
+            let result_env = vec![];
+
+            impl_eval_test_with_env(
+                $input, 
+                env, 
+                $res, 
+                result_env)
         }
     }
 
-    macro_rules! impl_eval_test_with_env {
-        ($input:literal, $env:expr, $res:expr) => {
-            let (root, mut ast) = parse_str($input).unwrap();
-            let result = match eval(&mut $env, &mut ast, root) {
-                Ok(result) => {
-                    result
-                }
-                err => {
-                    panic!("{err:?}");
-                    // Node::Hole
-                }
-            };
-
-            println!("--- AST ---");
-            for (i, node) in ast.nodes.iter().enumerate() {
-                println!("{i}: {node:?}");
-                
-            }
-
-            let result = ast.nodes[result].clone();
-            assert_eq!(result, $res);
-            // ast.dump_dot(result, "/tmp/dump");
-        }
-    }
 
     macro_rules! impl_err_test {
         ($input:literal, $res:expr) => {
@@ -4760,38 +4785,42 @@ mod tests {
 
     #[test]
     fn test_eval_with_function_returns_closure_with_improved_env() {
-        let input = "x -> x";
-        let (root, mut ast) = parse_str(input).unwrap();
-
-        let new_env = [
-            ("a".to_string(), Node::Int { data: 1 }),
-            ("b".to_string(), Node::Int { data: 2 }),
-        ];
-
-        let mut env = HashMap::new();
-        for (name, node) in new_env {
-            let node_id = NodeId(ast.nodes.len());
-            ast.nodes.push(node);
-            env.insert(name, node_id);
-        }
-            
-
-        let result = match eval(&mut env, &mut ast, root) {
-            Ok(result) => {
-                result
-            }
-            err => {
-                panic!("{err:?}");
-                // Node::Hole
-            }
-        };
-
-        println!("--- AST ---");
-        for (i, node) in ast.nodes.iter().enumerate() {
-            println!("{i}: {node:?}");
-        }
-
-        assert_eq!(result, NodeId(2));
-        // ast.dump_dot(result, "/tmp/dump");
+        impl_eval_test_with_env(
+            "x -> x",
+            vec![ 
+                ("a".to_string(), NodeId(0)),
+                ("b".to_string(), NodeId(1)),
+            ],
+            Node::Closure { env: HashMap::new(), expr: NodeId(2) },
+            vec![
+                ("a".to_string(), NodeId(0)),
+                ("b".to_string(), NodeId(1)),
+            ]
+        );
     }
+
+    #[test]
+    fn test_eval_assign_returns_env_object() {
+        impl_eval_test_with_env(
+            "a = 1",
+            vec![ ],
+            Node::Assign { left: NodeId(0), right: NodeId(1) },
+            vec![
+                ("a".to_string(), NodeId(1))
+            ]
+        );
+    }
+
+    #[test]
+    fn test_eval_assign_function_returns_closure_without_function_in_env() {
+        impl_eval_test_with_env(
+            "a = x -> x",
+            vec![ ],
+            Node::Assign { left: NodeId(0), right: NodeId(3) },
+            vec![
+                ("a".to_string(), NodeId(3))
+            ]
+        );
+    }
+
 }
