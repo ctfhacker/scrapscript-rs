@@ -443,6 +443,7 @@ pub enum Type {
     StrConcat,
     ListCons,
     ListAppend,
+    Where
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -930,6 +931,7 @@ impl SyntaxTree {
             Node::StrConcat { .. } => Type::StrConcat,
             Node::Function { .. } => Type::Function,
             Node::Assign { .. } => Type::Assign,
+            Node::Where  { .. } => Type::Where,
             
             x => unimplemented!("Unknown type for node: {x:?}"),
             
@@ -946,6 +948,7 @@ impl SyntaxTree {
 
 #[derive(Debug, PartialEq)]
 pub enum EvalError {
+    InternalError,
     InvalidAssignmentVariable,
     InvalidNodeTypes(Node),
     ExponentPowerTooLarge(i64),
@@ -953,7 +956,10 @@ pub enum EvalError {
     ListTypeMismatch(Node),
 
     /// The name of a function was not a `Var`
-    InvalidFunctionName
+    InvalidFunctionName,
+
+    /// Attempted to use a variable not found in the scope
+    VariableNotFoundInScope(String)
 }
 
 /// Evaluate the given node at `root` using the given context `ctx`
@@ -1090,7 +1096,28 @@ pub fn eval<S: std::hash::BuildHasher>(
 
                     Ok(ast.float(data, node_pos))
                 }
+
+                (Node::Var { data: var }, Node::Int { data: number}) | 
+                (Node::Int { data: number}, Node::Var { data: var }) => {
+                    // Check if the requested variable is in scope
+                    let Some(var_node_id) = ctx.get(var) else {
+                        return Err((EvalError::VariableNotFoundInScope(var.to_string()), node_pos));
+                    };
+
+                    // Check that the variable is of the same type
+                    let Node::Int { data: var_num } = ast.nodes[*var_node_id] else {
+                        return Err((EvalError::InvalidNodeTypes(ast.nodes[*var_node_id].clone()), ast.positions[root.0]));
+                    };
+
+                    Ok(ast.int(var_num + number, node_pos))
+                }
                 _ => {
+                    if let Node::Add { left, right } = ast.nodes[root] {
+                        dbg!(&ctx);
+                        dbg!(&ast.nodes[left]);
+                        dbg!(&ast.nodes[right]);
+                    }
+
                     Err((EvalError::InvalidNodeTypes(ast.nodes[root].clone()), ast.positions[root.0]))
                 }
             }
@@ -1239,6 +1266,21 @@ pub fn eval<S: std::hash::BuildHasher>(
 
 
             Ok(ast.list(results, node_pos))
+        }
+        Type::Where => {
+            let Node::Where { left, right } = ast.nodes[root] else {
+                unreachable!();
+            };
+
+            let mut local_scope = HashMap::new();
+
+            // Evaluate the right side of the where clause to gather the environment
+            let _ = eval(&mut local_scope, ast, right)?;
+
+            // Use the evaluated environment to evaluate the left side
+            let left_data = eval(&mut local_scope, ast, left)?;
+
+            Ok(left_data)
         }
     }
     
@@ -2123,7 +2165,10 @@ mod tests {
             env.insert(key.to_string(), *value);
         }
 
-        let curr_result = eval(&mut env, &mut ast, root).ok().unwrap();
+        let curr_result = match eval(&mut env, &mut ast, root) {
+            Ok(result) => result,
+            Err(err) => panic!("{err:?}"),
+        };
 
         println!("--- AST ---");
         for (i, node) in ast.nodes.iter().enumerate() {
@@ -4593,7 +4638,7 @@ mod tests {
     #[test]
     fn test_eval_add_string() {
         impl_err_test!("1 + hello",
-            (EvalError::InvalidNodeTypes(Node::Add { left: NodeId(0), right: NodeId(1) }), 2)
+            (EvalError::VariableNotFoundInScope("hello".to_string()), 2)
         );
     }
 
@@ -4605,7 +4650,7 @@ mod tests {
     #[test]
     fn test_eval_sub_string() {
         impl_err_test!("1 - hello",
-            (EvalError::InvalidNodeTypes(Node::Sub { left: NodeId(0), right: NodeId(1) }), 2));
+            (EvalError::VariableNotFoundInScope("hello".to_string()), 2));
     }
 
     #[test]
@@ -4621,7 +4666,7 @@ mod tests {
     #[test]
     fn test_eval_mul_string() {
         impl_err_test!("1 * hello",
-            (EvalError::InvalidNodeTypes(Node::Mul { left: NodeId(0), right: NodeId(1) }), 2)
+            (EvalError::VariableNotFoundInScope("hello".to_string()), 2)
         );
     }
 
@@ -4863,5 +4908,18 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn test_eval_where_evalulates_in_order() {
+        impl_eval_test_with_env(
+            "a + 2 . a = 1",
+            vec![ ],
+            Node::Int { data: 3 },
+            vec![
+
+            ]
+        );
+    }
+
 
 }
