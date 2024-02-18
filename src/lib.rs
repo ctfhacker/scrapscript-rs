@@ -1,4 +1,6 @@
 #![feature(concat_idents)]
+#![feature(let_chains)]
+
 use core::ops::{Index, IndexMut};
 use std::collections::{HashSet, HashMap};
 
@@ -1102,9 +1104,31 @@ pub fn eval<S: std::hash::BuildHasher>(
                 return Err((EvalError::InvalidAssignmentVariable, ast.positions[left.0]));
             };
 
-            ctx.insert(var.to_string(), right);
+            let env_key = var.to_string();
+            
+            if let Node::Function { body, .. } = ast.nodes[right] && ast.nodes[body] == ast.nodes[left] {
+                // Assigning a variable to a function with a body of that variable IS a closure
 
-            Ok(root)
+                // Get the closure id ahead of time
+                let closure_id = ast.nodes.len();
+
+                // Create the closure env with its id in it
+                let mut closure_env = HashMap::new();
+                closure_env.insert(var.to_string(), NodeId(closure_id));
+
+                // Create the new closure
+                let closure_id = ast.closure(closure_env, right, ast.positions[root.0]);
+
+                // Add the variable assignment to the environment
+                ctx.insert(env_key, closure_id);
+
+                // Return the closure as the result
+                Ok(closure_id)
+
+            } else {
+                ctx.insert(env_key, right);
+                Ok(root)
+            } 
         }
         Type::Function => {
             let Node::Function { name, body} = ast.nodes[root] else {
@@ -2106,6 +2130,8 @@ mod tests {
             println!("{i}: {node:?}");
         
         }
+
+        dbg!(&env);
 
         let curr_result = ast.nodes[curr_result].clone();
         assert_eq!(curr_result, wanted_result);
@@ -4819,6 +4845,21 @@ mod tests {
             Node::Assign { left: NodeId(0), right: NodeId(3) },
             vec![
                 ("a".to_string(), NodeId(3))
+            ]
+        );
+    }
+
+    #[test]
+    fn test_eval_assign_function_returns_closure_with_function_in_env() {
+        let mut closure_env = HashMap::new();
+        closure_env.insert("a".to_string(), NodeId(5));
+
+        impl_eval_test_with_env(
+            "a = x -> a",
+            vec![ ],
+            Node::Closure { env: closure_env, expr: NodeId(3) },
+            vec![
+                ("a".to_string(), NodeId(5))
             ]
         );
     }
