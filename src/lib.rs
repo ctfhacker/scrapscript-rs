@@ -234,6 +234,12 @@ pub enum Node {
     /// A hole node
     Hole,
 
+    /// A true node
+    True,
+
+    /// A false node
+    False,
+
     /// An integer value (leaf)
     Int { data: i64 },
 
@@ -368,6 +374,8 @@ impl Node {
     #[must_use]
     pub fn label(&self) -> String {
         match self {
+            Node::True => "true".to_string(),
+            Node::False => "false".to_string(),
             Node::Int { data } => format!("{data:#x}"),
             Node::Float { data } => format!("{data:.4}"),
             Node::List { .. } => {
@@ -423,7 +431,10 @@ impl Node {
 }
 
 
+#[derive(Debug)]
 pub enum Type {
+    True,
+    False,
     Int,
     Float,
     String,
@@ -443,7 +454,8 @@ pub enum Type {
     StrConcat,
     ListCons,
     ListAppend,
-    Where
+    Where,
+    Assert,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -739,6 +751,18 @@ impl SyntaxTree {
         self.add_node(node, pos)
     }
 
+    /// Insert a `true` node
+    pub fn true_node(&mut self, pos: u32) -> NodeId {
+        let node = Node::True;
+        self.add_node(node, pos)
+    }
+
+    /// Insert a `true` node
+    pub fn false_node(&mut self, pos: u32) -> NodeId {
+        let node = Node::False;
+        self.add_node(node, pos)
+    }
+
     /// Dump a .dot of this syntax tree
     ///
     /// # Errors
@@ -874,8 +898,10 @@ impl SyntaxTree {
                 | Node::String { .. } 
                 | Node::Symbol { .. } 
                 | Node::Bytes { .. } 
-                | Node::Hole 
+                | Node::Hole { .. }
                 | Node::Spread  { .. }
+                | Node::True { .. }
+                | Node::False { .. }
                 => {
                     // This is a leaf node.. nothing else to parse
                 }
@@ -932,7 +958,9 @@ impl SyntaxTree {
             Node::Function { .. } => Type::Function,
             Node::Assign { .. } => Type::Assign,
             Node::Where  { .. } => Type::Where,
-            
+            Node::Assert { .. } => Type::Assert,
+            Node::True { .. } => Type::True,
+            Node::False { .. } => Type::False,
             x => unimplemented!("Unknown type for node: {x:?}"),
             
         }
@@ -959,7 +987,10 @@ pub enum EvalError {
     InvalidFunctionName,
 
     /// Attempted to use a variable not found in the scope
-    VariableNotFoundInScope(String)
+    VariableNotFoundInScope(String),
+
+    /// Evaluated a #false type in a condition
+    FalseConditionFound
 }
 
 /// Evaluate the given node at `root` using the given context `ctx`
@@ -1020,13 +1051,11 @@ pub fn eval<S: std::hash::BuildHasher>(
                                 result = !result;
                             }
 
-                            let symbol = if result {
-                                "true".to_string()
+                            if result {
+                                return Ok(ast.true_node(node_pos));
                             } else {
-                                "false".to_string()
-                            };
-                                
-                            return Ok(ast.symbol(symbol, node_pos));
+                                return Ok(ast.false_node(node_pos));
+                            }
                         }
                         Type::Div { .. } | Type::FloorDiv { .. } =>  left_int / right_int,
                         Type::Exp { .. } =>  {
@@ -1082,13 +1111,11 @@ pub fn eval<S: std::hash::BuildHasher>(
                                 result = !result;
                             }
 
-                            let symbol = if result {
-                                "true".to_string()
+                            if result {
+                                return Ok(ast.true_node(node_pos));
                             } else {
-                                "false".to_string()
-                            };
-                                
-                            return Ok(ast.symbol(symbol, node_pos));
+                                return Ok(ast.false_node(node_pos));
+                            }
                         }
                         _ => unreachable!("{:?}", ast.nodes[root])
                     };
@@ -1110,6 +1137,32 @@ pub fn eval<S: std::hash::BuildHasher>(
                     };
 
                     Ok(ast.int(var_num + number, node_pos))
+                }
+                (Node::Var { data: var_left }, Node::Var { data: var_right }) => {
+                    // a + b
+
+                    // Check if the requested variable is in scope
+                    let Some(left_node_id) = ctx.get(var_left) else {
+                        return Err((EvalError::VariableNotFoundInScope(var_left.to_string()), node_pos));
+                    };
+                    let left_node_id = *left_node_id;
+
+                    // Check if the requested variable is in scope
+                    let Some(right_node_id) = ctx.get(var_right) else {
+                        return Err((EvalError::VariableNotFoundInScope(var_right.to_string()), node_pos));
+                    };
+                    let right_node_id = *right_node_id;
+
+                    // Evaluate both sides of the addition
+                    let left_data = eval(ctx, ast, left_node_id)?;
+                    let right_data = eval(ctx, ast, right_node_id)?;
+
+                    // Add 
+                    let res_node = ast.add(left_data, right_data, node_pos);
+
+                    let result = eval(ctx, ast, res_node)?;
+
+                    Ok(result)
                 }
                 _ => {
                     if let Node::Add { left, right } = ast.nodes[root] {
@@ -1277,10 +1330,42 @@ pub fn eval<S: std::hash::BuildHasher>(
             // Evaluate the right side of the where clause to gather the environment
             let _ = eval(&mut local_scope, ast, right)?;
 
+            // Add the found scope's env into the global scope
+            ctx.extend(local_scope.clone());
+
             // Use the evaluated environment to evaluate the left side
-            let left_data = eval(&mut local_scope, ast, left)?;
+            let left_data = eval(ctx, ast, left)?;
+
+            // Add the found scope's env into the global scope
+            ctx.extend(local_scope);
 
             Ok(left_data)
+        }
+        Type::Assert => {
+            let Node::Assert { left, right } = ast.nodes[root] else {
+                unreachable!();
+            };
+
+            let left_data = eval(ctx, ast, left)?;
+            let right_data = eval(ctx, ast, right)?;
+
+            let left_data = ast.get(left_data);
+            let right_data = ast.get(right_data);
+
+            dbg!(left_data);
+            dbg!(right_data);
+
+            match (left_data, right_data) {
+                (Node::True, _) =>  Ok(left),
+                (_, Node::True) =>  Ok(right),
+                (Node::False, _) => return Err((EvalError::FalseConditionFound, ast.positions[left.0])),
+                (_, Node::False) => return Err((EvalError::FalseConditionFound, ast.positions[right.0])),
+                _ => todo!()
+            }
+
+        }
+        Type::True | Type::False => {
+            Ok(root)
         }
     }
     
@@ -1809,8 +1894,13 @@ pub fn _parse(
             }
             TokenId::Symbol => {
                 continue_while!(is_valid_symbol_byte);
-                let name = input[input_index..=end_input_index].to_string();
-                ast.symbol(name, (input_index - 1).try_into().unwrap())
+                let pos = (input_index - 1).try_into().unwrap();
+
+                match &input[input_index..=end_input_index] {
+                    "true" => ast.true_node(pos),
+                    "false" => ast.false_node(pos),
+                    x => ast.symbol(x.to_string(), pos),
+                }
             }
             TokenId::Base85 => {
                 continue_while!(is_valid_base85_byte);
@@ -2167,7 +2257,9 @@ mod tests {
 
         let curr_result = match eval(&mut env, &mut ast, root) {
             Ok(result) => result,
-            Err(err) => panic!("{err:?}"),
+            Err(err) => {
+                panic!("{err:?}");
+            }
         };
 
         println!("--- AST ---");
@@ -4716,26 +4808,26 @@ mod tests {
 
     #[test]
     fn test_eval_equal_int_true() {
-        impl_eval_test!("8 == 3", Node::Symbol { data: "false".to_string() });
-        impl_eval_test!("8 /= 3", Node::Symbol { data: "true".to_string() });
+        impl_eval_test!("8 == 3", Node::False);
+        impl_eval_test!("8 /= 3", Node::True);
     }
 
     #[test]
     fn test_eval_equal_int_false() {
-        impl_eval_test!("8 == 8", Node::Symbol { data: "true".to_string() });
-        impl_eval_test!("8 /= 8", Node::Symbol { data: "false".to_string() });
+        impl_eval_test!("8 == 8", Node::True);
+        impl_eval_test!("8 /= 8", Node::False);
     }
 
     #[test]
     fn test_eval_equal_float_true() {
-        impl_eval_test!("8.0 == 8.0", Node::Symbol { data: "true".to_string() });
-        impl_eval_test!("8.0 /= 8.0", Node::Symbol { data: "false".to_string() });
+        impl_eval_test!("8.0 == 8.0", Node::True);
+        impl_eval_test!("8.0 /= 8.0", Node::False);
     }
 
     #[test]
     fn test_eval_equal_float_false() {
-        impl_eval_test!("8.0 == 2.0", Node::Symbol { data: "false".to_string() });
-        impl_eval_test!("8.0 /= 2.0", Node::Symbol { data: "true".to_string() });
+        impl_eval_test!("8.0 == 2.0", Node::False);
+        impl_eval_test!("8.0 /= 2.0", Node::True);
     }
 
     #[test]
@@ -4750,27 +4842,27 @@ mod tests {
 
     #[test]
     fn test_eval_equal_negative_float_false() {
-        impl_eval_test!("8.0 == -2.0", Node::Symbol { data: "false".to_string() });
-        impl_eval_test!("8.0 /= -2.0", Node::Symbol { data: "true".to_string() });
+        impl_eval_test!("8.0 == -2.0", Node::False);
+        impl_eval_test!("8.0 /= -2.0", Node::True);
     }
 
     #[test]
     fn test_eval_equal_negative_float_true() {
-        impl_eval_test!("-8.0 == -8.0", Node::Symbol { data: "true".to_string() });
-        impl_eval_test!("-8.0 /= -8.0", Node::Symbol { data: "false".to_string() });
+        impl_eval_test!("-8.0 == -8.0", Node::True);
+        impl_eval_test!("-8.0 /= -8.0", Node::False);
     }
 
     #[test]
     fn test_eval_equal_float_true_tests() {
-        impl_eval_test!("0.0 == 0.0", Node::Symbol { data: "true".to_string() });
-        impl_eval_test!("0.00000001 == 0.0", Node::Symbol { data: "false".to_string() });
-        impl_eval_test!("0.00000000001 == 0.0", Node::Symbol { data: "false".to_string() });
-        impl_eval_test!("0.000000000000001 == 0.0", Node::Symbol { data: "true".to_string() });
+        impl_eval_test!("0.0 == 0.0", Node::True);
+        impl_eval_test!("0.00000001 == 0.0", Node::False);
+        impl_eval_test!("0.00000000001 == 0.0", Node::False);
+        impl_eval_test!("0.000000000000001 == 0.0", Node::True);
 
-        impl_eval_test!("0.0 /= 0.0", Node::Symbol { data: "false".to_string() });
-        impl_eval_test!("0.00000001 /= 0.0", Node::Symbol { data: "true".to_string() });
-        impl_eval_test!("0.00000000001 /= 0.0", Node::Symbol { data: "true".to_string() });
-        impl_eval_test!("0.000000000000001 /= 0.0", Node::Symbol { data: "false".to_string() });
+        impl_eval_test!("0.0 /= 0.0", Node::False);
+        impl_eval_test!("0.00000001 /= 0.0", Node::True);
+        impl_eval_test!("0.00000000001 /= 0.0", Node::True);
+        impl_eval_test!("0.000000000000001 /= 0.0", Node::False);
     }
 
     #[test]
@@ -4910,16 +5002,27 @@ mod tests {
     }
 
     #[test]
-    fn test_eval_where_evalulates_in_order() {
+    fn test_eval_nested_where() {
         impl_eval_test_with_env(
-            "a + 2 . a = 1",
+            "a + b 
+                    . a = 1 . b = 2",
             vec![ ],
             Node::Int { data: 3 },
             vec![
-
+                ("b".to_string(), NodeId(8)),
+                ("a".to_string(), NodeId(4)),
             ]
         );
     }
 
+    #[test]
+    fn test_eval_assert_with_truthy_cond_returns_true() {
+        impl_eval_test_with_env(
+            "123 ? #true",
+            vec![ ],
+            Node::True,
+            vec![ ]
+        );
+    }
 
 }
