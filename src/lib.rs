@@ -1,6 +1,9 @@
 #![feature(concat_idents)]
 #![feature(let_chains)]
 
+mod colors;
+use colors::Colorized;
+
 use core::ops::{Index, IndexMut};
 use std::collections::{HashSet, HashMap};
 
@@ -479,7 +482,10 @@ pub enum Error {
     Tokenize((TokenError, usize)),
 
     /// An error occured during parsing
-    Parse((ParseError, usize))
+    Parse((ParseError, usize)),
+
+    /// An error occured during evaluation
+    Eval((EvalError, usize))
 }
 
 impl From<(TokenError, usize)> for Error {
@@ -974,7 +980,7 @@ impl SyntaxTree {
     }
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum EvalError {
     InternalError,
     InvalidAssignmentVariable,
@@ -1128,6 +1134,12 @@ pub fn eval<S: std::hash::BuildHasher>(
                 (Node::Int { data: number}, Node::Var { data: var }) => {
                     // Check if the requested variable is in scope
                     let Some(var_node_id) = ctx.get(var) else {
+                        let node_pos = if matches!(left_data, Node::Var { .. }) {
+                            ast.positions[left.0]
+                        } else {
+                            ast.positions[right.0]
+                        };
+
                         return Err((EvalError::VariableNotFoundInScope(var.to_string()), node_pos));
                     };
 
@@ -1270,7 +1282,7 @@ pub fn eval<S: std::hash::BuildHasher>(
 
                 Ok(ast.list(results, node_pos))
             } else {
-                Err((EvalError::ListTypeMismatch(right_data.clone()), node_pos))
+                Err((EvalError::ListTypeMismatch(right_data.clone()), ast.positions[right.0]))
             }
         }
         Type::ListAppend  => {
@@ -1356,8 +1368,8 @@ pub fn eval<S: std::hash::BuildHasher>(
             dbg!(right_data);
 
             match (left_data, right_data) {
-                (Node::True, _) =>  Ok(left),
-                (_, Node::True) =>  Ok(right),
+                (Node::True, _) =>  Ok(right),
+                (_, Node::True) =>  Ok(left),
                 (Node::False, _) => return Err((EvalError::FalseConditionFound, ast.positions[left.0])),
                 (_, Node::False) => return Err((EvalError::FalseConditionFound, ast.positions[right.0])),
                 _ => todo!()
@@ -1894,6 +1906,8 @@ pub fn _parse(
             }
             TokenId::Symbol => {
                 continue_while!(is_valid_symbol_byte);
+
+                // Start the symbol position at the # itself
                 let pos = (input_index - 1).try_into().unwrap();
 
                 match &input[input_index..=end_input_index] {
@@ -2238,6 +2252,127 @@ pub fn _parse(
 }
 
 
+/// Format an error message to be printed
+#[allow(dead_code)]
+fn print_error(input: &str, error: Error) {
+    const NEW_LINES_AROUND_ERROR: u32 = 2;
+    
+    let (error_str, location) = match error {
+        Error::Tokenize((err, location)) => {
+            (format!("{err:?}"), location)
+        }
+        Error::Parse((err, location)) => {
+            (format!("{err:?}"), location)
+        }
+        Error::Eval((err, location)) => {
+            (format!("{err:?}"), location)
+        }
+    };
+
+    println!("{}: {}",
+        format!("error").bold_red(),
+        format!("{error_str}").bold_bright_white()
+    );
+    println!();
+
+    // Find the start of the error block X new lines backwards
+    let mut start = 0;
+    let mut new_lines = 0;
+    for i in (0..location).rev() {
+        start = i;
+        if input.chars().nth(i) == Some('\n') {
+            new_lines += 1;
+            if new_lines >= NEW_LINES_AROUND_ERROR {
+                break;
+            }
+        }
+    }
+
+    // Find the end of the error block X new lines forwards
+    let mut end= 0;
+    let mut new_lines = 0;
+    for i in location..input.len() {
+        end = i;
+
+        if input.chars().nth(i) == Some('\n') {
+            new_lines += 1;
+            if new_lines >= NEW_LINES_AROUND_ERROR {
+                break;
+            }
+        }
+    }
+
+    // Find the line number the error was on
+    let mut line_num = 0;
+    let mut sum = 0;
+    for (line_index, line) in input.lines().enumerate() {
+        if (sum..sum + line.len()).contains(&location) {
+            line_num = line_index;
+            break;
+        }
+
+        sum += line.len();
+    }
+
+   
+    let curr_input = &input[start..=end];
+    let mut curr_loc = start;
+
+    println!("{:6} {} input_file:line_num:col_um", 
+        "",
+        format!("/").bold_bright_blue(),
+    );
+
+    // If the error is early in the file, still add the padding above the
+    // error for consistency
+    if line_num < 2 {
+        println!("{}", format!("{:6} | ", "").bold_bright_blue());
+    }
+    
+    for line in curr_input.lines() {
+        let has_error = (curr_loc..curr_loc + line.len()).contains(&location);
+
+        let mut padding = String::new();
+        if has_error {
+            padding = format!("{line_num:6}");
+        }
+
+        println!("{}{line}", format!("{padding:6} | ").bold_bright_blue());
+
+        // If this line has the error in it, print it here
+        if has_error {
+            let tokens = tokenize(&input[location..].split('\n').nth(0).unwrap()).unwrap();
+            assert!(tokens.len() >= 2);
+            let mut token_len = tokens[1].pos - tokens[0].pos;
+
+            if token_len + 1 < input.len().try_into().unwrap() {
+                token_len += 1;
+            }
+
+            println!("{:6} {} {}", 
+                "", 
+                format!("|").bold_bright_blue(),
+                format!("{}{} help: SPECIFIC HELP BASED ON ERROR..", 
+                    " ".repeat(location - curr_loc),
+                    "^".repeat(token_len as usize)).bold_yellow()
+            );
+        } 
+
+        // Line length plus new line character
+        curr_loc += line.len() + 1;
+    }
+    
+    println!("{:6} {} {}", 
+        "",
+        format!("\\").bold_bright_blue(),
+        format!("note: {}",
+            "Some other specific note for this error"
+        ).bold_white(),
+    );
+
+    println!("");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2247,7 +2382,7 @@ mod tests {
             input: &'static str, 
             init_env: Vec<(std::string::String, NodeId)>, 
             wanted_result: Node, 
-            result_env: Vec<(std::string::String, NodeId)>) {
+            result_env: Vec<(std::string::String, NodeId)>) -> Result<(), (EvalError, u32)> {
         let (root, mut ast) = parse_str(input).unwrap();
 
         let mut env: HashMap<std::string::String, NodeId> = HashMap::new();
@@ -2257,8 +2392,9 @@ mod tests {
 
         let curr_result = match eval(&mut env, &mut ast, root) {
             Ok(result) => result,
-            Err(err) => {
-                panic!("{err:?}");
+            Err((err, loc)) => {
+                print_error(input, Error::Eval((err.clone(), loc.try_into().unwrap())));
+                return Err((err, loc));
             }
         };
 
@@ -2278,6 +2414,8 @@ mod tests {
             res_env.insert(key.to_string(), *value);
         }
         assert_eq!(env, res_env);
+
+        Ok(())
         // ast.dump_dot(result, "/tmp/dump");
     }
 
@@ -4668,11 +4806,11 @@ mod tests {
             let env = vec![];
             let result_env = vec![];
 
-            impl_eval_test_with_env(
+            let _ = impl_eval_test_with_env(
                 $input, 
                 env, 
                 $res, 
-                result_env)
+                result_env);
         }
     }
 
@@ -4681,10 +4819,19 @@ mod tests {
         ($input:literal, $res:expr) => {
             let (root, mut ast) = parse_str($input).unwrap();
             let mut env = HashMap::new();
-            let result = eval(&mut env, &mut ast, root).err().unwrap();
-            dbg!(&result);
+            match eval(&mut env, &mut ast, root) {
+                Ok(result) => {
+                    dbg!(&result);
+                }
+                Err((err, loc)) => {
+                    if (err.clone(), loc) != $res {
+                        print_error($input, Error::Eval((err.clone(), loc as usize)));
+                    }
 
-            assert_eq!(result, $res);
+                    assert_eq!((err, loc), $res);
+                }
+                
+            }
         }
     }
 
@@ -4730,7 +4877,7 @@ mod tests {
     #[test]
     fn test_eval_add_string() {
         impl_err_test!("1 + hello",
-            (EvalError::VariableNotFoundInScope("hello".to_string()), 2)
+            (EvalError::VariableNotFoundInScope("hello".to_string()), 4)
         );
     }
 
@@ -4742,7 +4889,7 @@ mod tests {
     #[test]
     fn test_eval_sub_string() {
         impl_err_test!("1 - hello",
-            (EvalError::VariableNotFoundInScope("hello".to_string()), 2));
+            (EvalError::VariableNotFoundInScope("hello".to_string()), 4));
     }
 
     #[test]
@@ -4758,7 +4905,7 @@ mod tests {
     #[test]
     fn test_eval_mul_string() {
         impl_err_test!("1 * hello",
-            (EvalError::VariableNotFoundInScope("hello".to_string()), 2)
+            (EvalError::VariableNotFoundInScope("hello".to_string()), 4)
         );
     }
 
@@ -4899,7 +5046,7 @@ mod tests {
 
     #[test]
     fn test_eval_list_cons2() {
-        impl_err_test!("[2, 3] >+ 1", (EvalError::ListTypeMismatch(Node::Int { data: 1}), 7));
+        impl_err_test!("[2, 3] >+ 1", (EvalError::ListTypeMismatch(Node::Int { data: 1}), 10));
     }
 
     #[test]
@@ -4959,7 +5106,7 @@ mod tests {
                 ("a".to_string(), NodeId(0)),
                 ("b".to_string(), NodeId(1)),
             ]
-        );
+        ).unwrap();
     }
 
     #[test]
@@ -4971,7 +5118,7 @@ mod tests {
             vec![
                 ("a".to_string(), NodeId(1))
             ]
-        );
+        ).unwrap();
     }
 
     #[test]
@@ -4983,7 +5130,7 @@ mod tests {
             vec![
                 ("a".to_string(), NodeId(3))
             ]
-        );
+        ).unwrap();
     }
 
     #[test]
@@ -4998,7 +5145,7 @@ mod tests {
             vec![
                 ("a".to_string(), NodeId(5))
             ]
-        );
+        ).unwrap();
     }
 
     #[test]
@@ -5012,7 +5159,7 @@ mod tests {
                 ("b".to_string(), NodeId(8)),
                 ("a".to_string(), NodeId(4)),
             ]
-        );
+        ).unwrap();
     }
 
     #[test]
@@ -5020,9 +5167,32 @@ mod tests {
         impl_eval_test_with_env(
             "123 ? #true",
             vec![ ],
-            Node::True,
+            Node::Int { data : 123 },
             vec![ ]
-        );
+        ).unwrap();
     }
 
+    #[test]
+    fn test_eval_assert_with_truthy_cond_returns_true_right_side() {
+        impl_eval_test_with_env(
+            "#true ? 123",
+            vec![ ],
+            Node::Int { data : 123 },
+            vec![ ]
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_eval_assert_with_truthy_cond_returns_false() {
+        let err = impl_eval_test_with_env(
+            "123 ? #false",
+            vec![ ],
+            Node::Int { data : 123 },
+            vec![ ]
+        );
+
+        assert_eq!(err,
+            Err((EvalError::FalseConditionFound, 6))
+        )
+    }
 }
