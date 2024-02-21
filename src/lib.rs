@@ -2385,6 +2385,8 @@ mod tests {
             result_env: Vec<(std::string::String, NodeId)>) -> Result<(), (EvalError, u32)> {
         let (root, mut ast) = parse_str(input).unwrap();
 
+        ast.dump_dot(root, "/tmp/dump");
+
         let mut env: HashMap<std::string::String, NodeId> = HashMap::new();
         for (key, value) in init_env.iter() {
             env.insert(key.to_string(), *value);
@@ -2404,8 +2406,6 @@ mod tests {
         
         }
 
-        dbg!(&env);
-
         let curr_result = ast.nodes[curr_result].clone();
         assert_eq!(curr_result, wanted_result);
 
@@ -2415,8 +2415,8 @@ mod tests {
         }
         assert_eq!(env, res_env);
 
+
         Ok(())
-        // ast.dump_dot(result, "/tmp/dump");
     }
 
     #[test]
@@ -5151,8 +5151,10 @@ mod tests {
     #[test]
     fn test_eval_nested_where() {
         impl_eval_test_with_env(
-            "a + b 
-                    . a = 1 . b = 2",
+            "
+            a + b 
+            . a = 1 
+            . b = 2",
             vec![ ],
             Node::Int { data: 3 },
             vec![
