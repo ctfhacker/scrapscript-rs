@@ -888,12 +888,16 @@ impl SyntaxTree {
                     }
                 }
                 Node::Closure { env, expr } => {
+                    use std::fmt::Write;
+
                     dbg!(&env);
                     queue.push(*expr);
 
                     let label = env.iter()
-                        .map(|(key, node_id)| format!("{}={}", key, self.nodes[*node_id].label()))
-                        .collect::<String>();
+                        .fold(String::new(), |mut acc, (key, node_id)| {
+                            let _ = write!(acc, "{}={}", key, self.nodes[*node_id].label());
+                            acc
+                        });
 
                     dot.push_str(&format!("node [shape=record]; {node_id} [ label = \"CLOSURE\nEnv:\n{label}\" ];\n"));
                     dot.push_str(&format!("{node_id} -> {expr}  [ label=\"expr\"; ];\n"));
@@ -1059,9 +1063,9 @@ pub fn eval<S: std::hash::BuildHasher>(
 
                             if result {
                                 return Ok(ast.true_node(node_pos));
-                            } else {
-                                return Ok(ast.false_node(node_pos));
-                            }
+                            } 
+
+                            return Ok(ast.false_node(node_pos));
                         }
                         Type::Div { .. } | Type::FloorDiv { .. } =>  left_int / right_int,
                         Type::Exp { .. } =>  {
@@ -1119,9 +1123,9 @@ pub fn eval<S: std::hash::BuildHasher>(
 
                             if result {
                                 return Ok(ast.true_node(node_pos));
-                            } else {
-                                return Ok(ast.false_node(node_pos));
-                            }
+                            } 
+
+                            return Ok(ast.false_node(node_pos));
                         }
                         _ => unreachable!("{:?}", ast.nodes[root])
                     };
@@ -2378,17 +2382,18 @@ mod tests {
     use super::*;
     use TokenId::*;
 
+    #[allow(clippy::needless_pass_by_value)]
     fn impl_eval_test_with_env(
             input: &'static str, 
-            init_env: Vec<(std::string::String, NodeId)>, 
+            init_env: &[(std::string::String, NodeId)],
             wanted_result: Node, 
-            result_env: Vec<(std::string::String, NodeId)>) -> Result<(), (EvalError, u32)> {
+            result_env: &[(std::string::String, NodeId)]) -> Result<(), (EvalError, u32)> {
         let (root, mut ast) = parse_str(input).unwrap();
 
-        ast.dump_dot(root, "/tmp/dump");
+        // ast.dump_dot(root, "/tmp/dump");
 
         let mut env: HashMap<std::string::String, NodeId> = HashMap::new();
-        for (key, value) in init_env.iter() {
+        for (key, value) in init_env {
             env.insert(key.to_string(), *value);
         }
 
@@ -2410,7 +2415,7 @@ mod tests {
         assert_eq!(curr_result, wanted_result);
 
         let mut res_env = HashMap::new();
-        for (key, value) in result_env.iter() {
+        for (key, value) in result_env {
             res_env.insert(key.to_string(), *value);
         }
         assert_eq!(env, res_env);
@@ -4808,9 +4813,9 @@ mod tests {
 
             let _ = impl_eval_test_with_env(
                 $input, 
-                env, 
+                &env, 
                 $res, 
-                result_env);
+                &result_env);
         }
     }
 
@@ -5097,12 +5102,12 @@ mod tests {
     fn test_eval_with_function_returns_closure_with_improved_env() {
         impl_eval_test_with_env(
             "x -> x",
-            vec![ 
+            &[ 
                 ("a".to_string(), NodeId(0)),
                 ("b".to_string(), NodeId(1)),
             ],
             Node::Closure { env: HashMap::new(), expr: NodeId(2) },
-            vec![
+            &[
                 ("a".to_string(), NodeId(0)),
                 ("b".to_string(), NodeId(1)),
             ]
@@ -5113,9 +5118,9 @@ mod tests {
     fn test_eval_assign_returns_env_object() {
         impl_eval_test_with_env(
             "a = 1",
-            vec![ ],
+            &[ ],
             Node::Assign { left: NodeId(0), right: NodeId(1) },
-            vec![
+            &[
                 ("a".to_string(), NodeId(1))
             ]
         ).unwrap();
@@ -5125,9 +5130,9 @@ mod tests {
     fn test_eval_assign_function_returns_closure_without_function_in_env() {
         impl_eval_test_with_env(
             "a = x -> x",
-            vec![ ],
+            &[ ],
             Node::Assign { left: NodeId(0), right: NodeId(3) },
-            vec![
+            &[
                 ("a".to_string(), NodeId(3))
             ]
         ).unwrap();
@@ -5140,9 +5145,9 @@ mod tests {
 
         impl_eval_test_with_env(
             "a = x -> a",
-            vec![ ],
+            &[ ],
             Node::Closure { env: closure_env, expr: NodeId(3) },
-            vec![
+            &[
                 ("a".to_string(), NodeId(5))
             ]
         ).unwrap();
@@ -5155,9 +5160,9 @@ mod tests {
             a + b 
             . a = 1 
             . b = 2",
-            vec![ ],
+            &[ ],
             Node::Int { data: 3 },
-            vec![
+            &[
                 ("b".to_string(), NodeId(8)),
                 ("a".to_string(), NodeId(4)),
             ]
@@ -5168,9 +5173,9 @@ mod tests {
     fn test_eval_assert_with_truthy_cond_returns_true() {
         impl_eval_test_with_env(
             "123 ? #true",
-            vec![ ],
+            &[ ],
             Node::Int { data : 123 },
-            vec![ ]
+            &[ ]
         ).unwrap();
     }
 
@@ -5178,9 +5183,9 @@ mod tests {
     fn test_eval_assert_with_truthy_cond_returns_true_right_side() {
         impl_eval_test_with_env(
             "#true ? 123",
-            vec![ ],
+            &[ ],
             Node::Int { data : 123 },
-            vec![ ]
+            &[ ]
         ).unwrap();
     }
 
@@ -5188,13 +5193,25 @@ mod tests {
     fn test_eval_assert_with_truthy_cond_returns_false() {
         let err = impl_eval_test_with_env(
             "123 ? #false",
-            vec![ ],
+            &[ ],
             Node::Int { data : 123 },
-            vec![ ]
+            &[ ]
         );
 
         assert_eq!(err,
             Err((EvalError::FalseConditionFound, 6))
-        )
+        );
     }
+
+    /*
+    #[test]
+    fn test_eval_nested_assert() {
+        let err = impl_eval_test_with_env(
+            "123 ? #true ? #true",
+            &[ ],
+            Node::Int { data : 123 },
+            &[ ]
+        ).unwrap();
+    }
+    */
 }
