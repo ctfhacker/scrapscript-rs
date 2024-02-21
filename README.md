@@ -22,4 +22,4 @@ a + b
 . b = 2
 ```
 
-[svg](./docs/dumps.svg)
+[svg](./docs/dump.svg)
