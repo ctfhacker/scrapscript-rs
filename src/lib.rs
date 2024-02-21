@@ -459,6 +459,7 @@ pub enum Type {
     ListAppend,
     Where,
     Assert,
+    Hole,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -971,6 +972,7 @@ impl SyntaxTree {
             Node::Assert { .. } => Type::Assert,
             Node::True { .. } => Type::True,
             Node::False { .. } => Type::False,
+            Node::Hole { .. } => Type::Hole,
             x => unimplemented!("Unknown type for node: {x:?}"),
             
         }
@@ -1046,8 +1048,8 @@ pub fn eval<S: std::hash::BuildHasher>(
             let right_data = ast.get(right_data);
 
             match (left_data, right_data) {
-                // Adding two Ints
                 (Node::Int { data: left_int}, Node::Int { data: right_int}) => {
+                    // Adding two Ints
                     let data= match node_type {
                         Type::Add =>  left_int + right_int ,
                         Type::Sub =>  left_int - right_int ,
@@ -1311,10 +1313,6 @@ pub fn eval<S: std::hash::BuildHasher>(
             dbg!(&right_data);
             todo!()
         }
-        Type::Int { .. } | Type::Float { .. } | Type::Var { .. } | Type::String { .. } => {
-            // Base case.. Return the node as is. Nothing more to evaluate
-            Ok(root)
-        }
         Type::List => {
             let mut results = Vec::new();
             let mut list_len = 0;
@@ -1376,9 +1374,18 @@ pub fn eval<S: std::hash::BuildHasher>(
                 _ => todo!()
             }
         }
-        Type::True | Type::False => {
+        Type::Int
+        | Type::Float
+        | Type::Var
+        | Type::String
+        | Type::Hole 
+        | Type::True
+        | Type::False
+        => {
+            // Base case.. Return the node as is. Nothing more to evaluate
             Ok(root)
         }
+
     }
     
 }
@@ -5206,6 +5213,16 @@ mod tests {
             "123 ? #true ? #true",
             &[ ],
             Node::Int { data : 123 },
+            &[ ]
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_eval_hold() {
+        impl_eval_test_with_env(
+            "()",
+            &[ ],
+            Node::Hole,
             &[ ]
         ).unwrap();
     }
