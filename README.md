@@ -23,3 +23,9 @@ a + b
 ```
 
 ![svg](./docs/dump.svg)
+
+## Error messages
+
+Infrastructure for error messages in the compiler
+
+![errors](./docs/errors.png)
