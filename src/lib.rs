@@ -1362,23 +1362,19 @@ pub fn eval<S: std::hash::BuildHasher>(
                 unreachable!();
             };
 
-            let left_data = eval(ctx, ast, left)?;
-            let right_data = eval(ctx, ast, right)?;
+            let left_data_id = eval(ctx, ast, left)?;
+            let right_data_id = eval(ctx, ast, right)?;
 
-            let left_data = ast.get(left_data);
-            let right_data = ast.get(right_data);
-
-            dbg!(left_data);
-            dbg!(right_data);
+            let left_data = ast.get(left_data_id);
+            let right_data = ast.get(right_data_id);
 
             match (left_data, right_data) {
-                (Node::True, _) =>  Ok(right),
-                (_, Node::True) =>  Ok(left),
+                (Node::True, _) =>  Ok(right_data_id),
+                (_, Node::True) =>  Ok(left_data_id),
                 (Node::False, _) => Err((EvalError::FalseConditionFound, ast.positions[left.0])),
                 (_, Node::False) => Err((EvalError::FalseConditionFound, ast.positions[right.0])),
                 _ => todo!()
             }
-
         }
         Type::True | Type::False => {
             Ok(root)
@@ -2408,8 +2404,9 @@ mod tests {
         println!("--- AST ---");
         for (i, node) in ast.nodes.iter().enumerate() {
             println!("{i}: {node:?}");
-        
         }
+
+        dbg!(curr_result);
 
         let curr_result = ast.nodes[curr_result].clone();
         assert_eq!(curr_result, wanted_result);
@@ -5203,15 +5200,13 @@ mod tests {
         );
     }
 
-    /*
     #[test]
     fn test_eval_nested_assert() {
-        let err = impl_eval_test_with_env(
+        impl_eval_test_with_env(
             "123 ? #true ? #true",
             &[ ],
             Node::Int { data : 123 },
             &[ ]
         ).unwrap();
     }
-    */
 }
