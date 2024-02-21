@@ -1374,8 +1374,8 @@ pub fn eval<S: std::hash::BuildHasher>(
             match (left_data, right_data) {
                 (Node::True, _) =>  Ok(right),
                 (_, Node::True) =>  Ok(left),
-                (Node::False, _) => return Err((EvalError::FalseConditionFound, ast.positions[left.0])),
-                (_, Node::False) => return Err((EvalError::FalseConditionFound, ast.positions[right.0])),
+                (Node::False, _) => Err((EvalError::FalseConditionFound, ast.positions[left.0])),
+                (_, Node::False) => Err((EvalError::FalseConditionFound, ast.positions[right.0])),
                 _ => todo!()
             }
 
@@ -2274,8 +2274,8 @@ fn print_error(input: &str, error: Error) {
     };
 
     println!("{}: {}",
-        format!("error").bold_red(),
-        format!("{error_str}").bold_bright_white()
+        "error".to_string().bold_red(),
+        error_str.to_string().bold_bright_white()
     );
     println!();
 
@@ -2324,7 +2324,7 @@ fn print_error(input: &str, error: Error) {
 
     println!("{:6} {} input_file:line_num:col_um", 
         "",
-        format!("/").bold_bright_blue(),
+        "/".to_string().bold_bright_blue(),
     );
 
     // If the error is early in the file, still add the padding above the
@@ -2345,7 +2345,7 @@ fn print_error(input: &str, error: Error) {
 
         // If this line has the error in it, print it here
         if has_error {
-            let tokens = tokenize(&input[location..].split('\n').nth(0).unwrap()).unwrap();
+            let tokens = tokenize(input[location..].split('\n').next().unwrap()).unwrap();
             assert!(tokens.len() >= 2);
             let mut token_len = tokens[1].pos - tokens[0].pos;
 
@@ -2355,7 +2355,7 @@ fn print_error(input: &str, error: Error) {
 
             println!("{:6} {} {}", 
                 "", 
-                format!("|").bold_bright_blue(),
+                "|".to_string().bold_bright_blue(),
                 format!("{}{} help: SPECIFIC HELP BASED ON ERROR..", 
                     " ".repeat(location - curr_loc),
                     "^".repeat(token_len as usize)).bold_yellow()
@@ -2368,13 +2368,13 @@ fn print_error(input: &str, error: Error) {
     
     println!("{:6} {} {}", 
         "",
-        format!("\\").bold_bright_blue(),
+        "\\".to_string().bold_bright_blue(),
         format!("note: {}",
             "Some other specific note for this error"
         ).bold_white(),
     );
 
-    println!("");
+    println!();
 }
 
 #[cfg(test)]
