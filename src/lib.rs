@@ -460,6 +460,7 @@ pub enum Type {
     Where,
     Assert,
     Hole,
+    Apply,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -487,6 +488,28 @@ pub enum Error {
 
     /// An error occured during evaluation
     Eval((EvalError, usize))
+}
+
+impl Error {
+    /// The help message to display for this error
+    pub fn help(&self) -> Option<String> {
+        match self {
+            Error::Eval((EvalError::VariableNotFoundInScope(var), _)) => {
+                Some(format!("Was variable `{var}` defined before this use?"))
+            }
+            _ => None
+        }
+    }
+
+    /// The note message to display for this error
+    pub fn note(&self) -> Option<String> {
+        match self {
+            Error::Eval((EvalError::VariableNotFoundInScope(_), _)) => {
+                Some(format!("This is testing a specific note."))
+            }
+            _ => None
+        }
+    }
 }
 
 impl From<(TokenError, usize)> for Error {
@@ -973,6 +996,7 @@ impl SyntaxTree {
             Node::True { .. } => Type::True,
             Node::False { .. } => Type::False,
             Node::Hole { .. } => Type::Hole,
+            Node::Apply { .. } => Type::Apply,
             x => unimplemented!("Unknown type for node: {x:?}"),
             
         }
@@ -1373,6 +1397,22 @@ pub fn eval<S: std::hash::BuildHasher>(
                 (_, Node::False) => Err((EvalError::FalseConditionFound, ast.positions[right.0])),
                 _ => todo!()
             }
+        }
+        Type::Apply => {
+            let Node::Apply { left, right } = ast.nodes[root] else {
+                unreachable!();
+            };
+
+            let left_data_id = eval(ctx, ast, left)?;
+            let right_data_id = eval(ctx, ast, right)?;
+
+            let left_data = ast.get(left_data_id);
+            let right_data = ast.get(right_data_id);
+
+            dbg!(left_data);
+            dbg!(right_data);
+
+            todo!();
         }
         Type::Int
         | Type::Float
@@ -2265,13 +2305,13 @@ fn print_error(input: &str, error: Error) {
     const NEW_LINES_AROUND_ERROR: u32 = 2;
     
     let (error_str, location) = match error {
-        Error::Tokenize((err, location)) => {
+        Error::Tokenize((ref err, location)) => {
             (format!("{err:?}"), location)
         }
-        Error::Parse((err, location)) => {
+        Error::Parse((ref err, location)) => {
             (format!("{err:?}"), location)
         }
-        Error::Eval((err, location)) => {
+        Error::Eval((ref err, location)) => {
             (format!("{err:?}"), location)
         }
     };
@@ -2348,36 +2388,334 @@ fn print_error(input: &str, error: Error) {
 
         // If this line has the error in it, print it here
         if has_error {
-            let tokens = tokenize(input[location..].split('\n').next().unwrap()).unwrap();
+            let curr_input = input[location..].split('\n').next().unwrap();
+            let tokens = tokenize(curr_input).unwrap();
             assert!(tokens.len() >= 2);
-            let mut token_len = tokens[1].pos - tokens[0].pos;
+            let mut token_len = token_length(curr_input).unwrap();
 
             if token_len + 1 < input.len().try_into().unwrap() {
                 token_len += 1;
             }
 
-            println!("{:6} {} {}", 
+            // Create the marker line
+            let mut token_line = format!("{:6} {} {} ",
                 "", 
                 "|".to_string().bold_bright_blue(),
-                format!("{}{} help: SPECIFIC HELP BASED ON ERROR..", 
+                format!("{}{}", 
                     " ".repeat(location - curr_loc),
-                    "^".repeat(token_len as usize)).bold_yellow()
+                    "^".repeat(token_len as usize).bold_yellow(),
+                ),
             );
+
+            // Add a help message if one applies for this error
+            if let Some(help) = error.help() {
+                token_line.push_str(&format!("help: {help}").bold_yellow().to_string());
+            };
+
+            println!("{token_line}");
         } 
 
         // Line length plus new line character
         curr_loc += line.len() + 1;
     }
     
-    println!("{:6} {} {}", 
+    let mut note_line =  format!("{:6} {} ", 
         "",
         "\\".to_string().bold_bright_blue(),
-        format!("note: {}",
-            "Some other specific note for this error"
-        ).bold_white(),
     );
 
+    if let Some(note) = error.note() {
+        note_line.push_str(&format!("note: {note}").bold_white().to_string())
+    }
+
+    println!("{note_line}");
+
     println!();
+}
+
+/// Get the length of the token located at the beginning of the given string
+pub fn token_length(input: &str) -> Result<usize, (TokenError, usize)> {
+    let input = input.as_bytes();
+
+    let mut index = 0;
+    let mut pos;
+
+    macro_rules! continue_while_space {
+        () => {
+            // Skip over all whitespace. Reset the current token when hitting whitespace.
+            while matches!(input[index], b' ' | b'\n' | b'\r' | b'\t') {
+                index += 1;
+            }
+        };
+    }
+
+    macro_rules! continue_while {
+        ($until:pat) => {
+            // Skip over all whitespace. Reset the current token when hitting whitespace.
+            while matches!(input[index], $until) {
+                index += 1;
+            }
+        };
+    }
+
+    macro_rules! continue_until {
+        ($until:pat) => {
+            // Skip over all whitespace. Reset the current token when hitting whitespace.
+            while !matches!(input[index], $until) {
+                index += 1;
+            }
+
+            // Skip over the found pattern
+            index += 1;
+        };
+    }
+
+    macro_rules! set_token {
+        ($token:ident, $num_chars:literal) => {
+            index += $num_chars;
+        };
+    }
+
+    // Continue past the whitespace
+    continue_while_space!();
+    pos = index;
+
+    // println!("{pos}: {}", input[index] as char);
+    match &input {
+        [b'-', b'-', ..] => {
+            // Comments are -- COMMENT
+            set_token!(Comment, 2);
+            continue_until!(b'\n');
+        }
+        [b'"', ..] => {
+            set_token!(String, 1);
+
+            // Skip over all whitespace. Reset the current token when hitting whitespace.
+            while !matches!(input[index], b'"') {
+                index += 1;
+
+                if index >= input.len() {
+                    return Err((TokenError::UnquotedEndOfString, pos));
+                }
+            }
+
+            // Skip over the found pattern
+            index += 1;
+        }
+        [b'.', b'.', b'.', ..] => {
+            set_token!(OpSpread, 3);
+        }
+        [b'.', b'.', ..] => {
+            return Err((TokenError::DotDot, pos));
+        }
+        [b'.', b' ', ..] => {
+            set_token!(OpWhere, 2);
+        }
+        [b'~', b'~', b'8', b'5', b'\'', ..] => {
+            pos += 5;
+            index += 5;
+            set_token!(Base85, 5);
+
+            continue_while!(b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | 
+                b'!' | b'#' | b'$' | b'%' | b'&' | b'(' | b')' | b'*' | 
+                b'+' | b'-' | b';' | b'<' | b'=' | b'>' | b'?' | b'@' | 
+                b'^' | b'_' | b'`' | b'{' | b'|' | b'}' | b'~' | b'"');
+
+            println!("Base85: After: {pos} {index}");
+        }
+        [b'~', b'~', b'3', b'2', b'\'', ..] => {
+            pos += 5;
+            index += 5;
+            set_token!(Base32, 5);
+            continue_while!(b'A'..=b'Z' | b'2'..=b'7' | b'=');
+            println!("Base32: After: {pos} {index}");
+        }
+        [b'~', b'~', b'1', b'6', b'\'', ..] => {
+            index += 5;
+            set_token!(Base16, 5);
+            continue_while!(b'A'..=b'F' | b'a'..=b'f' | b'0'..=b'9');
+        }
+        [b'~', b'~', b'6', b'4', b'\'', ..] => {
+            index += 5;
+            set_token!(Base64, 5);
+            continue_while!(b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'=');
+        }
+        [b'~', b'~', ..] => {
+            index += 2;
+            set_token!(Base64, 2);
+            continue_while!(b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'=');
+        }
+        [b'0'..=b'9' | b'.', ..] => {
+            let mut id = TokenId::Int;
+
+            // Read all digits and potential '.' for floats
+            while matches!(input[index], b'0'..=b'9' | b'.') {
+                if input[index] == b'.' {
+                    if id == TokenId::Float {
+                        return Err((TokenError::FloatWithMultipleDecimalPoints, index));
+                    }
+
+                    id = TokenId::Float;
+                };
+
+                index += 1;
+            }
+        }
+        // Name [a-zA-z$'_][a-zA-Z$'_0-9]*
+        [b'a'..=b'z' | b'A'..=b'Z' | b'$' | b'\'' | b'_', ..] => {
+            // Only allow quotes for names that start with $
+            let allow_quotes = input[index] == b'$';
+
+            set_token!(Name, 1);
+
+            // Skip over all characters allowed in a name
+            while matches!(input[index], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'$' | b'_' | b'\'')
+            {
+                // Explicitly disallow quotes in the variable
+                if !allow_quotes && input[index] == b'\'' {
+                    return Err((TokenError::QuoteInVariable, index));
+                }
+
+                index += 1;
+            }
+        }
+        [b'-', b'>', ..] => {
+            set_token!(OpFunction, 2);
+        }
+        [b'>', b'>', ..] => {
+            set_token!(OpCompose, 2);
+        }
+        [b'<', b'<', ..] => {
+            set_token!(OpComposeReverse, 2);
+        }
+        [b'=', b'=', ..] => {
+            set_token!(OpEqual, 2);
+        }
+        [b'/', b'/', ..] => {
+            set_token!(OpFloorDiv, 2);
+        }
+        [b'/', b'=', ..] => {
+            set_token!(OpNotEqual, 2);
+        }
+        [b'<', b'=', ..] => {
+            set_token!(OpLessEqual, 2);
+        }
+        [b'>', b'=', ..] => {
+            set_token!(OpGreaterEqual, 2);
+        }
+        [b'&', b'&', ..] => {
+            set_token!(OpAnd, 2);
+        }
+        [b'|', b'|', ..] => {
+            set_token!(OpOr, 2);
+        }
+        [b'+', b'+', ..] => {
+            set_token!(OpStrConcat, 2);
+        }
+        [b'>', b'+', ..] => {
+            set_token!(OpListCons, 2);
+        }
+        [b'+', b'<', ..] => {
+            set_token!(OpListAppend, 2);
+        }
+        [b'|', b'>', ..] => {
+            set_token!(OpPipe, 2);
+        }
+        [b'<', b'|', ..] => {
+            set_token!(OpReversePipe, 2);
+        }
+        [b'#', ..] => {
+            index += 1;
+
+            let mut is_empty = true;
+            continue_while_space!();
+
+            pos = index;
+            set_token!(Symbol, 0);
+
+            // Skip over all characters allowed in a name
+            while index < input.len() && is_valid_symbol_byte(input[index]) {
+                index += 1;
+                is_empty = false;
+            }
+
+            if is_empty {
+                if index >= input.len() {
+                    return Err((TokenError::UnexpectedEndOfFile, pos));
+                }
+
+                return Err((TokenError::InvalidSymbol, pos));
+            }
+        }
+        [b'*', ..] => {
+            set_token!(OpMul, 1);
+        }
+        [b'+', ..] => {
+            set_token!(OpAdd, 1);
+        }
+        [b'/', ..] => {
+            set_token!(OpDiv, 1);
+        }
+        [b'^', ..] => {
+            set_token!(OpExp, 1);
+        }
+        [b'!', ..] => {
+            set_token!(OpRightEval, 1);
+        }
+        [b'@', ..] => {
+            set_token!(OpAccess, 1);
+        }
+        [b':', ..] => {
+            set_token!(OpHasType, 1);
+        }
+        [b'%', ..] => {
+            set_token!(OpMod, 1);
+        }
+        [b'<', ..] => {
+            set_token!(OpLess, 1);
+        }
+        [b'>', ..] => {
+            set_token!(OpGreater, 1);
+        }
+        [b'=', ..] => {
+            set_token!(OpAssign, 1);
+        }
+        [b'|', ..] => {
+            set_token!(OpMatchCase, 1);
+        }
+        [b'(', ..] => {
+            set_token!(LeftParen, 1);
+        }
+        [b')', ..] => {
+            set_token!(RightParen, 1);
+        }
+        [b'[', ..] => {
+            set_token!(LeftBracket, 1);
+        }
+        [b']', ..] => {
+            set_token!(RightBracket, 1);
+        }
+        [b',', ..] => {
+            set_token!(Comma, 1);
+        }
+        [b'{', ..] => {
+            set_token!(LeftBrace, 1);
+        }
+        [b'}', ..] => {
+            set_token!(RightBrace, 1);
+        }
+        [b'?', ..] => {
+            set_token!(OpAssert, 1);
+        }
+        [b'-', ..] => {
+            set_token!(OpSub, 1);
+        }
+        x => {
+            return Err((TokenError::UnknownCharacter(x[0] as char), pos));
+        }
+    }
+
+    Ok(index - 1)
 }
 
 #[cfg(test)]
@@ -5223,6 +5561,16 @@ mod tests {
             "()",
             &[ ],
             Node::Hole,
+            &[ ]
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_eval_function_application_one_arg() {
+        impl_eval_test_with_env(
+            "(x -> x + 1) 2",
+            &[ ],
+            Node::Int { data: 3 },
             &[ ]
         ).unwrap();
     }
