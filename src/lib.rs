@@ -322,7 +322,7 @@ pub enum Node {
     Or { left: NodeId, right: NodeId },
 
     /// An apply operation between two nodes
-    Apply { left: NodeId, right: NodeId },
+    Apply { func: NodeId, arg: NodeId },
 
     /// A list append operation between two nodes
     ListAppend { left: NodeId, right: NodeId },
@@ -346,7 +346,7 @@ pub enum Node {
     RightEval { left: NodeId, right: NodeId },
 
     /// A function operation
-    Function { name: NodeId, body: NodeId },
+    Function { arg: NodeId, body: NodeId },
 
     /// A match case
     MatchCase { left: NodeId, right: NodeId },
@@ -492,6 +492,7 @@ pub enum Error {
 
 impl Error {
     /// The help message to display for this error
+    #[must_use]
     pub fn help(&self) -> Option<String> {
         match self {
             Error::Eval((EvalError::VariableNotFoundInScope(var), _)) => {
@@ -502,10 +503,11 @@ impl Error {
     }
 
     /// The note message to display for this error
+    #[must_use]
     pub fn note(&self) -> Option<String> {
         match self {
             Error::Eval((EvalError::VariableNotFoundInScope(_), _)) => {
-                Some(format!("This is testing a specific note."))
+                Some("This is testing a specific note.".to_string())
             }
             _ => None
         }
@@ -727,7 +729,6 @@ impl SyntaxTree {
     impl_left_right_node!(and, And);
     impl_left_right_node!(or, Or);
     impl_left_right_node!(access, Access);
-    impl_left_right_node!(apply, Apply);
     impl_left_right_node!(list_append, ListAppend);
     impl_left_right_node!(str_concat, StrConcat);
     impl_left_right_node!(list_cons, ListCons);
@@ -764,9 +765,15 @@ impl SyntaxTree {
         self.add_node(node, pos)
     }
 
+    /// Insert an Apply node with the given `func` and `arg`
+    pub fn apply(&mut self, func: NodeId, arg: NodeId, pos: u32) -> NodeId {
+        let node = Node::Apply { func, arg };
+        self.add_node(node, pos)
+    }
+
     /// Insert a function node with the given `name` and `body`
     pub fn function(&mut self, name: NodeId, body: NodeId, pos: u32) -> NodeId {
-        let node = Node::Function { name, body};
+        let node = Node::Function { arg: name, body};
         self.add_node(node, pos)
     }
 
@@ -830,7 +837,6 @@ impl SyntaxTree {
                 | Node::Div { left, right }
                 | Node::FloorDiv { left, right }
                 | Node::Mod { left, right }
-                | Node::Apply { left, right }
                 | Node::ListAppend { left, right }
                 | Node::StrConcat { left, right }
                 | Node::ListCons { left, right }
@@ -856,12 +862,19 @@ impl SyntaxTree {
                     dot.push_str(&format!("{node_id} -> {left}  [ label=\"left\"; ];\n"));
                     dot.push_str(&format!("{node_id} -> {right} [ label=\"right\"; ];\n"));
                 }
-                Node::Function { name, body} => {
+                Node::Function { arg: name, body} => {
                     queue.push(*name);
                     queue.push(*body);
 
                     dot.push_str(&format!("{node_id} -> {name}  [ label=\"name\"; ];\n"));
                     dot.push_str(&format!("{node_id} -> {body} [ label=\"body\"; ];\n"));
+                }
+                Node::Apply { func, arg } => {
+                    queue.push(*func);
+                    queue.push(*arg);
+
+                    dot.push_str(&format!("{node_id} -> {func}  [ label=\"func\"; ];\n"));
+                    dot.push_str(&format!("{node_id} -> {arg} [ label=\"arg\"; ];\n"));
                 }
                 Node::List { data} => {
                     let label = data
@@ -1026,7 +1039,10 @@ pub enum EvalError {
     VariableNotFoundInScope(String),
 
     /// Evaluated a #false type in a condition
-    FalseConditionFound
+    FalseConditionFound,
+
+    /// Function argument was not a variable
+    NonVariableAsFunctionName
 }
 
 /// Evaluate the given node at `root` using the given context `ctx`
@@ -1253,7 +1269,7 @@ pub fn eval<S: std::hash::BuildHasher>(
             } 
         }
         Type::Function => {
-            let Node::Function { name, body} = ast.nodes[root] else {
+            let Node::Function { arg: name, body} = ast.nodes[root] else {
                 unreachable!();
             };
 
@@ -1399,20 +1415,34 @@ pub fn eval<S: std::hash::BuildHasher>(
             }
         }
         Type::Apply => {
-            let Node::Apply { left, right } = ast.nodes[root] else {
+            let Node::Apply { func, arg } = ast.nodes[root] else {
                 unreachable!();
             };
 
-            let left_data_id = eval(ctx, ast, left)?;
-            let right_data_id = eval(ctx, ast, right)?;
+            let Node::Function { arg: arg_name, body } = ast.nodes[func] else {
+                unreachable!();
+            };
+            
+            let name_data_id = eval(ctx, ast, arg_name)?;
+            let arg_data_id = eval(ctx, ast, arg)?;
 
-            let left_data = ast.get(left_data_id);
-            let right_data = ast.get(right_data_id);
+            let name_data = ast.get(name_data_id);
 
-            dbg!(left_data);
-            dbg!(right_data);
+            let Node::Var { data: arg_name } = name_data else {
+                return Err((EvalError::NonVariableAsFunctionName, ast.positions[arg_name.0]));
+                
+            };
 
-            todo!();
+            dbg!(arg_name);
+
+            // Create the environment to call the requested function
+            let mut new_env = HashMap::new();
+            new_env.insert(arg_name.clone(), arg_data_id);
+
+            // Evaluate the function body with the 
+            let result= eval(&mut new_env, ast, body)?;
+
+            Ok(result)
         }
         Type::Int
         | Type::Float
@@ -2118,7 +2148,7 @@ pub fn _parse(
                     dbg!(&ast.nodes[case]);
 
                     match ast.nodes.get(case.0) {
-                        Some(Node::Function { name, body }) => {
+                        Some(Node::Function { arg: name, body }) => {
                             // Replace the Function with a MatchCase node
                             ast.nodes[case] = Node::MatchCase { left: *name, right: *body };
                             matches.push(case);
@@ -2301,18 +2331,18 @@ pub fn _parse(
 
 /// Format an error message to be printed
 #[allow(dead_code)]
-fn print_error(input: &str, error: Error) {
+fn print_error(input: &str, error: &Error) {
     const NEW_LINES_AROUND_ERROR: u32 = 2;
     
     let (error_str, location) = match error {
         Error::Tokenize((ref err, location)) => {
-            (format!("{err:?}"), location)
+            (format!("{err:?}"), *location)
         }
         Error::Parse((ref err, location)) => {
-            (format!("{err:?}"), location)
+            (format!("{err:?}"), *location)
         }
         Error::Eval((ref err, location)) => {
-            (format!("{err:?}"), location)
+            (format!("{err:?}"), *location)
         }
     };
 
@@ -2393,18 +2423,19 @@ fn print_error(input: &str, error: Error) {
             assert!(tokens.len() >= 2);
             let mut token_len = token_length(curr_input).unwrap();
 
-            if token_len + 1 < input.len().try_into().unwrap() {
+            if token_len + 1 < input.len() {
                 token_len += 1;
             }
 
+            let token_marker = format!("{}{}", 
+                " ".repeat(location - curr_loc),
+                "^".repeat(token_len as usize).bold_yellow(),
+            );
+
             // Create the marker line
-            let mut token_line = format!("{:6} {} {} ",
+            let mut token_line = format!("{:6} {} {token_marker} ",
                 "", 
                 "|".to_string().bold_bright_blue(),
-                format!("{}{}", 
-                    " ".repeat(location - curr_loc),
-                    "^".repeat(token_len as usize).bold_yellow(),
-                ),
             );
 
             // Add a help message if one applies for this error
@@ -2425,7 +2456,7 @@ fn print_error(input: &str, error: Error) {
     );
 
     if let Some(note) = error.note() {
-        note_line.push_str(&format!("note: {note}").bold_white().to_string())
+        note_line.push_str(&format!("note: {note}").bold_white().to_string());
     }
 
     println!("{note_line}");
@@ -2434,6 +2465,11 @@ fn print_error(input: &str, error: Error) {
 }
 
 /// Get the length of the token located at the beginning of the given string
+///
+/// # Errors
+///
+/// * Token parsing error along with the position where the error occured
+#[allow(clippy::too_many_lines)]
 pub fn token_length(input: &str) -> Result<usize, (TokenError, usize)> {
     let input = input.as_bytes();
 
@@ -2470,12 +2506,6 @@ pub fn token_length(input: &str) -> Result<usize, (TokenError, usize)> {
         };
     }
 
-    macro_rules! set_token {
-        ($token:ident, $num_chars:literal) => {
-            index += $num_chars;
-        };
-    }
-
     // Continue past the whitespace
     continue_while_space!();
     pos = index;
@@ -2484,11 +2514,11 @@ pub fn token_length(input: &str) -> Result<usize, (TokenError, usize)> {
     match &input {
         [b'-', b'-', ..] => {
             // Comments are -- COMMENT
-            set_token!(Comment, 2);
+            index += 2;
             continue_until!(b'\n');
         }
         [b'"', ..] => {
-            set_token!(String, 1);
+            index += 1;
 
             // Skip over all whitespace. Reset the current token when hitting whitespace.
             while !matches!(input[index], b'"') {
@@ -2503,18 +2533,14 @@ pub fn token_length(input: &str) -> Result<usize, (TokenError, usize)> {
             index += 1;
         }
         [b'.', b'.', b'.', ..] => {
-            set_token!(OpSpread, 3);
+            index += 3;
         }
         [b'.', b'.', ..] => {
             return Err((TokenError::DotDot, pos));
         }
-        [b'.', b' ', ..] => {
-            set_token!(OpWhere, 2);
-        }
         [b'~', b'~', b'8', b'5', b'\'', ..] => {
             pos += 5;
             index += 5;
-            set_token!(Base85, 5);
 
             continue_while!(b'0'..=b'9' | b'A'..=b'Z' | b'a'..=b'z' | 
                 b'!' | b'#' | b'$' | b'%' | b'&' | b'(' | b')' | b'*' | 
@@ -2526,24 +2552,39 @@ pub fn token_length(input: &str) -> Result<usize, (TokenError, usize)> {
         [b'~', b'~', b'3', b'2', b'\'', ..] => {
             pos += 5;
             index += 5;
-            set_token!(Base32, 5);
             continue_while!(b'A'..=b'Z' | b'2'..=b'7' | b'=');
             println!("Base32: After: {pos} {index}");
         }
         [b'~', b'~', b'1', b'6', b'\'', ..] => {
             index += 5;
-            set_token!(Base16, 5);
             continue_while!(b'A'..=b'F' | b'a'..=b'f' | b'0'..=b'9');
         }
         [b'~', b'~', b'6', b'4', b'\'', ..] => {
             index += 5;
-            set_token!(Base64, 5);
             continue_while!(b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'=');
         }
         [b'~', b'~', ..] => {
             index += 2;
-            set_token!(Base64, 2);
             continue_while!(b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'=');
+        }
+        #[allow(clippy::unnested_or_patterns)]
+        [b'.', b' ', ..]
+        | [b'-', b'>', ..] 
+        | [b'>', b'>', ..]
+        | [b'<', b'<', ..]
+        | [b'=', b'=', ..]
+        | [b'/', b'/', ..]
+        | [b'/', b'=', ..]
+        | [b'<', b'=', ..]
+        | [b'>', b'=', ..]
+        | [b'&', b'&', ..]
+        | [b'|', b'|', ..]
+        | [b'+', b'+', ..]
+        | [b'>', b'+', ..]
+        | [b'+', b'<', ..]
+        | [b'|', b'>', ..]
+        | [b'<', b'|', ..] => {
+            index += 2;
         }
         [b'0'..=b'9' | b'.', ..] => {
             let mut id = TokenId::Int;
@@ -2566,7 +2607,7 @@ pub fn token_length(input: &str) -> Result<usize, (TokenError, usize)> {
             // Only allow quotes for names that start with $
             let allow_quotes = input[index] == b'$';
 
-            set_token!(Name, 1);
+            index += 1;
 
             // Skip over all characters allowed in a name
             while matches!(input[index], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'$' | b'_' | b'\'')
@@ -2579,51 +2620,6 @@ pub fn token_length(input: &str) -> Result<usize, (TokenError, usize)> {
                 index += 1;
             }
         }
-        [b'-', b'>', ..] => {
-            set_token!(OpFunction, 2);
-        }
-        [b'>', b'>', ..] => {
-            set_token!(OpCompose, 2);
-        }
-        [b'<', b'<', ..] => {
-            set_token!(OpComposeReverse, 2);
-        }
-        [b'=', b'=', ..] => {
-            set_token!(OpEqual, 2);
-        }
-        [b'/', b'/', ..] => {
-            set_token!(OpFloorDiv, 2);
-        }
-        [b'/', b'=', ..] => {
-            set_token!(OpNotEqual, 2);
-        }
-        [b'<', b'=', ..] => {
-            set_token!(OpLessEqual, 2);
-        }
-        [b'>', b'=', ..] => {
-            set_token!(OpGreaterEqual, 2);
-        }
-        [b'&', b'&', ..] => {
-            set_token!(OpAnd, 2);
-        }
-        [b'|', b'|', ..] => {
-            set_token!(OpOr, 2);
-        }
-        [b'+', b'+', ..] => {
-            set_token!(OpStrConcat, 2);
-        }
-        [b'>', b'+', ..] => {
-            set_token!(OpListCons, 2);
-        }
-        [b'+', b'<', ..] => {
-            set_token!(OpListAppend, 2);
-        }
-        [b'|', b'>', ..] => {
-            set_token!(OpPipe, 2);
-        }
-        [b'<', b'|', ..] => {
-            set_token!(OpReversePipe, 2);
-        }
         [b'#', ..] => {
             index += 1;
 
@@ -2631,7 +2627,6 @@ pub fn token_length(input: &str) -> Result<usize, (TokenError, usize)> {
             continue_while_space!();
 
             pos = index;
-            set_token!(Symbol, 0);
 
             // Skip over all characters allowed in a name
             while index < input.len() && is_valid_symbol_byte(input[index]) {
@@ -2647,68 +2642,11 @@ pub fn token_length(input: &str) -> Result<usize, (TokenError, usize)> {
                 return Err((TokenError::InvalidSymbol, pos));
             }
         }
-        [b'*', ..] => {
-            set_token!(OpMul, 1);
-        }
-        [b'+', ..] => {
-            set_token!(OpAdd, 1);
-        }
-        [b'/', ..] => {
-            set_token!(OpDiv, 1);
-        }
-        [b'^', ..] => {
-            set_token!(OpExp, 1);
-        }
-        [b'!', ..] => {
-            set_token!(OpRightEval, 1);
-        }
-        [b'@', ..] => {
-            set_token!(OpAccess, 1);
-        }
-        [b':', ..] => {
-            set_token!(OpHasType, 1);
-        }
-        [b'%', ..] => {
-            set_token!(OpMod, 1);
-        }
-        [b'<', ..] => {
-            set_token!(OpLess, 1);
-        }
-        [b'>', ..] => {
-            set_token!(OpGreater, 1);
-        }
-        [b'=', ..] => {
-            set_token!(OpAssign, 1);
-        }
-        [b'|', ..] => {
-            set_token!(OpMatchCase, 1);
-        }
-        [b'(', ..] => {
-            set_token!(LeftParen, 1);
-        }
-        [b')', ..] => {
-            set_token!(RightParen, 1);
-        }
-        [b'[', ..] => {
-            set_token!(LeftBracket, 1);
-        }
-        [b']', ..] => {
-            set_token!(RightBracket, 1);
-        }
-        [b',', ..] => {
-            set_token!(Comma, 1);
-        }
-        [b'{', ..] => {
-            set_token!(LeftBrace, 1);
-        }
-        [b'}', ..] => {
-            set_token!(RightBrace, 1);
-        }
-        [b'?', ..] => {
-            set_token!(OpAssert, 1);
-        }
-        [b'-', ..] => {
-            set_token!(OpSub, 1);
+        [b'*' | b'+' | b'/' | b'^' | b'!' | b'@' | b':' | b'%' | b'<' | b'>' |
+         b'=' | b'|' | b'(' | b')' | b'[' | b']' | b',' | b'{' | b'}' | b'?' |
+         b'-', 
+         .. ] => {
+            index += 1;
         }
         x => {
             return Err((TokenError::UnknownCharacter(x[0] as char), pos));
@@ -2731,7 +2669,7 @@ mod tests {
             result_env: &[(std::string::String, NodeId)]) -> Result<(), (EvalError, u32)> {
         let (root, mut ast) = parse_str(input).unwrap();
 
-        // ast.dump_dot(root, "/tmp/dump");
+        ast.dump_dot(root, "/tmp/dump").unwrap();
 
         let mut env: HashMap<std::string::String, NodeId> = HashMap::new();
         for (key, value) in init_env {
@@ -2741,7 +2679,7 @@ mod tests {
         let curr_result = match eval(&mut env, &mut ast, root) {
             Ok(result) => result,
             Err((err, loc)) => {
-                print_error(input, Error::Eval((err.clone(), loc.try_into().unwrap())));
+                print_error(input, &Error::Eval((err.clone(), loc.try_into().unwrap())));
                 return Err((err, loc));
             }
         };
@@ -3769,8 +3707,8 @@ mod tests {
                         data: "r".to_string()
                     },
                     Node::Apply {
-                        left: NodeId(2),
-                        right: NodeId(3)
+                        func: NodeId(2),
+                        arg: NodeId(3)
                     },
                 ],
                 positions: vec![u32::MAX, 1, 0, 3, 2]
@@ -4377,7 +4315,7 @@ mod tests {
                     Node::Var { data: "a".to_string() },
                     Node::Int { data: 1 },
                     Node::Add { left: NodeId(1), right: NodeId(2) },
-                    Node::Function { name: NodeId(0), body: NodeId(3) },
+                    Node::Function { arg: NodeId(0), body: NodeId(3) },
                 ],
                 positions: vec![0, 5, 9, 7, 2]
             }
@@ -4399,8 +4337,8 @@ mod tests {
                     Node::Var { data: "a".to_string() },
                     Node::Var { data: "b".to_string() },
                     Node::Add { left: NodeId(2), right: NodeId(3) },
-                    Node::Function { name: NodeId(1), body: NodeId(4) },
-                    Node::Function { name: NodeId(0), body: NodeId(5) },
+                    Node::Function { arg: NodeId(1), body: NodeId(4) },
+                    Node::Function { arg: NodeId(0), body: NodeId(5) },
                 ],
                 positions: vec![0, 5, 10, 14, 12, 7, 2]
             }
@@ -4419,7 +4357,7 @@ mod tests {
                     Node::Var { data: "id".to_string() },
                     Node::Var { data: "x".to_string() },
                     Node::Var { data: "x".to_string() },
-                    Node::Function { name: NodeId(1), body: NodeId(2) },
+                    Node::Function { arg: NodeId(1), body: NodeId(2) },
                     Node::Assign{ left: NodeId(0), right: NodeId(3) },
                 ],
                 positions: vec![0, 5, 10, 7, 3]
@@ -4438,7 +4376,7 @@ mod tests {
                 nodes: vec![
                     Node::Var { data: "f".to_string() },
                     Node::Var { data: "a".to_string() },
-                    Node::Apply { left: NodeId(0), right: NodeId(1) },
+                    Node::Apply { func: NodeId(0), arg: NodeId(1) },
                 ],
                 positions: vec![0,2,1]
             }
@@ -4456,9 +4394,9 @@ mod tests {
                 nodes: vec![
                     Node::Var { data: "f".to_string() },
                     Node::Var { data: "a".to_string() },
-                    Node::Apply { left: NodeId(0), right: NodeId(1) },
+                    Node::Apply { func: NodeId(0), arg: NodeId(1) },
                     Node::Var { data: "b".to_string() },
-                    Node::Apply { left: NodeId(2), right: NodeId(3) },
+                    Node::Apply { func: NodeId(2), arg: NodeId(3) },
                 ],
                 positions: vec![0,2,1,4,3]
             }
@@ -4624,7 +4562,7 @@ mod tests {
                 nodes: vec![
                     Node::Int { data: 1 },
                     Node::Var { data: "f".to_string() },
-                    Node::Apply { left: NodeId(1), right: NodeId(0) },
+                    Node::Apply { func: NodeId(1), arg: NodeId(0) },
                 ],
                 positions: vec![0, 5, 2]
             }
@@ -4642,9 +4580,9 @@ mod tests {
                 nodes: vec![
                     Node::Int { data: 1 },
                     Node::Var { data: "f".to_string() },
-                    Node::Apply { left: NodeId(1), right: NodeId(0) },
+                    Node::Apply { func: NodeId(1), arg: NodeId(0) },
                     Node::Var { data: "g".to_string() },
-                    Node::Apply { left: NodeId(3), right: NodeId(2) },
+                    Node::Apply { func: NodeId(3), arg: NodeId(2) },
                 ]
                 ,positions: vec![0, 5, 2, 10, 7]
             }
@@ -4662,7 +4600,7 @@ mod tests {
                 nodes: vec![
                     Node::Var { data: "f".to_string() },
                     Node::Int { data: 1 },
-                    Node::Apply { left: NodeId(0), right: NodeId(1) },
+                    Node::Apply { func: NodeId(0), arg: NodeId(1) },
                 ],
                 positions: vec![0, 5, 2]
             }
@@ -4681,8 +4619,8 @@ mod tests {
                     Node::Var { data: "g".to_string() },
                     Node::Var { data: "f".to_string() },
                     Node::Int { data: 1 },
-                    Node::Apply { left: NodeId(1), right: NodeId(2) },
-                    Node::Apply { left: NodeId(0), right: NodeId(3) },
+                    Node::Apply { func: NodeId(1), arg: NodeId(2) },
+                    Node::Apply { func: NodeId(0), arg: NodeId(3) },
                 ],
                 positions: vec![0, 5, 10, 7, 2]
             }
@@ -5172,7 +5110,7 @@ mod tests {
                 }
                 Err((err, loc)) => {
                     if (err.clone(), loc) != $res {
-                        print_error($input, Error::Eval((err.clone(), loc as usize)));
+                        print_error($input, &Error::Eval((err.clone(), loc as usize)));
                     }
 
                     assert_eq!((err, loc), $res);
