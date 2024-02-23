@@ -80,6 +80,7 @@ macro_rules! impl_formats {
 /// Implements each function that is available for adding color
 macro_rules! trait_func {
     ($color:ident, $ty:ident) => {
+        #[allow(dead_code)]
         fn $color(&self) -> Styled<Self, $ty>
         where
             Self: Sized,
