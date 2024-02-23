@@ -1042,7 +1042,20 @@ pub enum EvalError {
     FalseConditionFound,
 
     /// Function argument was not a variable
-    NonVariableAsFunctionName
+    NonVariableAsFunctionName,
+
+    /// Function called with no available arguments
+    NoArgumentsGivenToFunction,
+}
+
+#[derive(Debug, Default)]
+pub struct Context {
+    /// Variable assignments
+    pub env: HashMap<String, NodeId>,
+
+    /// Arguments passed to functions
+    pub args: Vec<NodeId>
+
 }
 
 /// Evaluate the given node at `root` using the given context `ctx`
@@ -1055,8 +1068,8 @@ pub enum EvalError {
 /// 
 /// * An error position cannot fit in `usize`
 #[allow(clippy::too_many_lines)]
-pub fn eval<S: std::hash::BuildHasher>(
-        ctx: &mut HashMap<String, NodeId, S>, 
+pub fn eval(
+        ctx: &mut Context, 
         ast: &mut SyntaxTree, 
         root: NodeId) -> Result<NodeId, (EvalError, u32)> {
     let node_type = ast.get_type(&root);
@@ -1179,7 +1192,7 @@ pub fn eval<S: std::hash::BuildHasher>(
                 (Node::Var { data: var }, Node::Int { data: number}) | 
                 (Node::Int { data: number}, Node::Var { data: var }) => {
                     // Check if the requested variable is in scope
-                    let Some(var_node_id) = ctx.get(var) else {
+                    let Some(var_node_id) = ctx.env.get(var) else {
                         let node_pos = if matches!(left_data, Node::Var { .. }) {
                             ast.positions[left.0]
                         } else {
@@ -1200,13 +1213,13 @@ pub fn eval<S: std::hash::BuildHasher>(
                     // a + b
 
                     // Check if the requested variable is in scope
-                    let Some(left_node_id) = ctx.get(var_left) else {
+                    let Some(left_node_id) = ctx.env.get(var_left) else {
                         return Err((EvalError::VariableNotFoundInScope(var_left.to_string()), node_pos));
                     };
                     let left_node_id = *left_node_id;
 
                     // Check if the requested variable is in scope
-                    let Some(right_node_id) = ctx.get(var_right) else {
+                    let Some(right_node_id) = ctx.env.get(var_right) else {
                         return Err((EvalError::VariableNotFoundInScope(var_right.to_string()), node_pos));
                     };
                     let right_node_id = *right_node_id;
@@ -1258,13 +1271,13 @@ pub fn eval<S: std::hash::BuildHasher>(
                 let closure_id = ast.closure(closure_env, right, ast.positions[root.0]);
 
                 // Add the variable assignment to the environment
-                ctx.insert(env_key, closure_id);
+                ctx.env.insert(env_key, closure_id);
 
                 // Return the closure as the result
                 Ok(closure_id)
 
             } else {
-                ctx.insert(env_key, right);
+                ctx.env.insert(env_key, right);
                 Ok(root)
             } 
         }
@@ -1273,18 +1286,27 @@ pub fn eval<S: std::hash::BuildHasher>(
                 unreachable!();
             };
 
-            let Node::Var { .. } = ast.nodes[name] else {
+            let arg_name = if let Node::Var { data } = &ast.nodes[name] {
+                data.clone()
+            } else {
                 return Err((EvalError::InvalidFunctionName, ast.positions[name.0]));
             };
 
-            let name_data = eval(ctx, ast, name)?;
-            let body_data = eval(ctx, ast, body)?;
+            // Pop the last argument given
+            let Some(argument) = ctx.args.pop() else {
+                return Err((EvalError::NoArgumentsGivenToFunction, node_pos));
+            };
 
-            dbg!(&name_data);
-            dbg!(&body_data);
+            // Add this argument to the environment
+            ctx.env.insert(arg_name.clone(), argument);
 
-            let new_env = HashMap::new();
-            Ok(ast.closure(new_env, root, node_pos))
+            // Evaluate the function using the new environment
+            let evaluated = eval(ctx, ast, body)?;
+
+            // Add this argument to the environment
+            ctx.env.remove(&arg_name);
+
+            Ok(evaluated)
         }
         Type::StrConcat => {
             let Node::StrConcat { left, right } = ast.nodes[root] else {
@@ -1379,19 +1401,19 @@ pub fn eval<S: std::hash::BuildHasher>(
                 unreachable!();
             };
 
-            let mut local_scope = HashMap::new();
+            let mut local_scope = Context::default();
 
             // Evaluate the right side of the where clause to gather the environment
             let _ = eval(&mut local_scope, ast, right)?;
 
             // Add the found scope's env into the global scope
-            ctx.extend(local_scope.clone());
+            ctx.env.extend(local_scope.env.clone());
 
             // Use the evaluated environment to evaluate the left side
             let left_data = eval(ctx, ast, left)?;
 
             // Add the found scope's env into the global scope
-            ctx.extend(local_scope);
+            ctx.env.extend(local_scope.env);
 
             Ok(left_data)
         }
@@ -1419,30 +1441,9 @@ pub fn eval<S: std::hash::BuildHasher>(
                 unreachable!();
             };
 
-            let Node::Function { arg: arg_name, body } = ast.nodes[func] else {
-                unreachable!();
-            };
-            
-            let name_data_id = eval(ctx, ast, arg_name)?;
-            let arg_data_id = eval(ctx, ast, arg)?;
-
-            let name_data = ast.get(name_data_id);
-
-            let Node::Var { data: arg_name } = name_data else {
-                return Err((EvalError::NonVariableAsFunctionName, ast.positions[arg_name.0]));
-                
-            };
-
-            dbg!(arg_name);
-
-            // Create the environment to call the requested function
-            let mut new_env = HashMap::new();
-            new_env.insert(arg_name.clone(), arg_data_id);
-
-            // Evaluate the function body with the 
-            let result= eval(&mut new_env, ast, body)?;
-
-            Ok(result)
+            // Add this argument to the current arguments, then evaluate the function
+            ctx.args.push(arg);
+            Ok(eval(ctx, ast, func)?)
         }
         Type::Int
         | Type::Float
@@ -2671,12 +2672,12 @@ mod tests {
 
         ast.dump_dot(root, "/tmp/dump").unwrap();
 
-        let mut env: HashMap<std::string::String, NodeId> = HashMap::new();
+        let mut ctx = Context::default();
         for (key, value) in init_env {
-            env.insert(key.to_string(), *value);
+            ctx.env.insert(key.to_string(), *value);
         }
 
-        let curr_result = match eval(&mut env, &mut ast, root) {
+        let curr_result = match eval(&mut ctx, &mut ast, root) {
             Ok(result) => result,
             Err((err, loc)) => {
                 print_error(input, &Error::Eval((err.clone(), loc.try_into().unwrap())));
@@ -2698,7 +2699,7 @@ mod tests {
         for (key, value) in result_env {
             res_env.insert(key.to_string(), *value);
         }
-        assert_eq!(env, res_env);
+        assert_eq!(ctx.env, res_env);
 
 
         Ok(())
@@ -5103,8 +5104,8 @@ mod tests {
     macro_rules! impl_err_test {
         ($input:literal, $res:expr) => {
             let (root, mut ast) = parse_str($input).unwrap();
-            let mut env = HashMap::new();
-            match eval(&mut env, &mut ast, root) {
+            let mut ctx = Context::default();
+            match eval(&mut ctx, &mut ast, root) {
                 Ok(result) => {
                     dbg!(&result);
                 }
@@ -5149,14 +5150,14 @@ mod tests {
     fn test_eval_variable() {
         let input = "a=3";
         let (root, mut ast) = parse_str(input).unwrap();
-        let mut env = HashMap::new();
-        let result = eval(&mut env, &mut ast, root).unwrap();
+        let mut ctx= Context::default();
+        let result = eval(&mut ctx, &mut ast, root).unwrap();
         let result = ast.nodes[result].clone();
         assert_eq!( result, Node::Assign { left: NodeId(0), right: NodeId(1) } );
 
         let mut check = HashMap::new();
         check.insert("a".to_string(), NodeId(1));
-        assert_eq!( env, check);
+        assert_eq!(ctx.env, check);
     }
 
     #[test]
@@ -5379,22 +5380,6 @@ mod tests {
     }
 
     #[test]
-    fn test_eval_with_function_returns_closure_with_improved_env() {
-        impl_eval_test_with_env(
-            "x -> x",
-            &[ 
-                ("a".to_string(), NodeId(0)),
-                ("b".to_string(), NodeId(1)),
-            ],
-            Node::Closure { env: HashMap::new(), expr: NodeId(2) },
-            &[
-                ("a".to_string(), NodeId(0)),
-                ("b".to_string(), NodeId(1)),
-            ]
-        ).unwrap();
-    }
-
-    #[test]
     fn test_eval_assign_returns_env_object() {
         impl_eval_test_with_env(
             "a = 1",
@@ -5509,6 +5494,16 @@ mod tests {
             "(x -> x + 1) 2",
             &[ ],
             Node::Int { data: 3 },
+            &[ ]
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_eval_function_application_two_args() {
+        impl_eval_test_with_env(
+            "(a -> b -> a + b) 3 3",
+            &[ ],
+            Node::Int { data: 6 },
             &[ ]
         ).unwrap();
     }
