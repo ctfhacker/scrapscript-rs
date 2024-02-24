@@ -434,7 +434,7 @@ impl Node {
 }
 
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum Type {
     True,
     False,
@@ -461,6 +461,9 @@ pub enum Type {
     Assert,
     Hole,
     Apply,
+    Record ,
+    Access,
+    MatchFunction,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1010,6 +1013,9 @@ impl SyntaxTree {
             Node::False { .. } => Type::False,
             Node::Hole { .. } => Type::Hole,
             Node::Apply { .. } => Type::Apply,
+            Node::Record { .. } => Type::Record,
+            Node::Access{ .. } => Type::Access,
+            Node::MatchFunction { .. } => Type::MatchFunction,
             x => unimplemented!("Unknown type for node: {x:?}"),
             
         }
@@ -1027,7 +1033,7 @@ impl SyntaxTree {
 pub enum EvalError {
     InternalError,
     InvalidAssignmentVariable,
-    InvalidNodeTypes(Node),
+    InvalidNodeTypes(Type),
     ExponentPowerTooLarge(i64),
     NonStringFoundInStringConcat(Node),
     ListTypeMismatch(Node),
@@ -1046,6 +1052,24 @@ pub enum EvalError {
 
     /// Function called with no available arguments
     NoArgumentsGivenToFunction,
+
+    /// The requested access object was not found in the environment
+    AccessObjectNotFound,
+
+    /// The given key is not found in the record
+    KeyNotFoundInRecord(String),
+
+    /// The given type for list access was invalid
+    InvalidListAccessType(Type),
+
+    /// The given type requested for access was invalid
+    InvalidAccessType(Type),
+
+    /// The given index is out of bounds of the requested list
+    ListIndexOutOfBounds { length: usize, wanted_index: usize },
+
+    /// Requested match case not found in match function
+    MatchCaseNotFound(Node, Vec<Node>)
 }
 
 #[derive(Debug, Default)]
@@ -1204,7 +1228,7 @@ pub fn eval(
 
                     // Check that the variable is of the same type
                     let Node::Int { data: var_num } = ast.nodes[*var_node_id] else {
-                        return Err((EvalError::InvalidNodeTypes(ast.nodes[*var_node_id].clone()), ast.positions[root.0]));
+                        return Err((EvalError::InvalidNodeTypes(ast.get_type(var_node_id)), ast.positions[root.0]));
                     };
 
                     Ok(ast.int(var_num + number, node_pos))
@@ -1242,7 +1266,7 @@ pub fn eval(
                         dbg!(&ast.nodes[right]);
                     }
 
-                    Err((EvalError::InvalidNodeTypes(ast.nodes[root].clone()), ast.positions[root.0]))
+                    Err((EvalError::InvalidNodeTypes(ast.get_type(&root)), ast.positions[root.0]))
                 }
             }
         }
@@ -1443,7 +1467,144 @@ pub fn eval(
 
             // Add this argument to the current arguments, then evaluate the function
             ctx.args.push(arg);
-            Ok(eval(ctx, ast, func)?)
+            dbg!(&ctx);
+
+            if let Node::Var { data: keyword } = &ast.nodes[func.0] {
+                let Some(target_func) = ctx.env.get(keyword) else {
+                    return Err((EvalError::VariableNotFoundInScope(keyword.clone()), ast.positions[func.0]));
+                };
+
+                Ok(eval(ctx, ast, *target_func)?)
+            } else {
+                Ok(eval(ctx, ast, func)?)
+            }
+        }
+        Type::Record => {
+            let mut length = 0;
+
+            if let Node::Record { keys, .. } = &ast.nodes[root] {
+                length = keys.len();
+            };
+
+            let mut new_keys = Vec::new();
+            let mut new_values= Vec::new();
+
+            for index in 0..length {
+                let Node::Record { values, .. } = &ast.nodes[root] else {
+                    unreachable!();
+                };
+
+                let curr_value = values[index];
+                let evaluated_id= eval(ctx, ast, curr_value)?;
+
+                let Node::Record { keys, .. } = &ast.nodes[root] else {
+                    unreachable!();
+                };
+
+                new_keys.push(keys[index]);
+                new_values.push(evaluated_id);
+            }
+
+            Ok(ast.record(new_keys, new_values, node_pos))
+        }
+        Type::Access => {
+            let Node::Access { left, right } = ast.nodes[root] else {
+                unreachable!();
+            };
+
+            let left_data_id = eval(ctx, ast, left)?;
+            let right_data_id = eval(ctx, ast, right)?;
+
+            let left_data = ast.get(left_data_id);
+            let right_data = ast.get(right_data_id);
+
+            let Node::Var { data: obj_name } = left_data else {
+                return Err((EvalError::AccessObjectNotFound, ast.positions[left.0]));
+            };
+
+            let Some(obj_id) = ctx.env.get(obj_name) else {
+                return Err((EvalError::VariableNotFoundInScope(obj_name.clone()), ast.positions[left.0]));
+            };
+
+            let obj = ast.get(*obj_id);
+            match obj {
+                Node::Record { keys, values } => {
+                    let Node::Var { data: wanted_key} = right_data else {
+                        unreachable!();
+                    };
+
+                    for index in 0..keys.len() {
+                        let Node::Var { data } = ast.get(keys[index]) else {
+                            unreachable!();
+                        };
+
+                        // If this isn't the requested key, keep looking
+                        if data != wanted_key {
+                            continue;
+                        }
+
+                        return Ok(values[index]);
+                    }
+
+                    Err((EvalError::KeyNotFoundInRecord(wanted_key.clone()), ast.positions[right.0]))
+                    
+                }
+                Node::List { data } => {
+                    let Node::Int { data: index} = right_data else {
+                        return Err((EvalError::InvalidListAccessType(ast.get_type(&right)), ast.positions[right.0]));
+                    };
+
+                    if usize::try_from(*index).unwrap() >= data.len() {
+                        return Err((
+                            EvalError::ListIndexOutOfBounds { 
+                                length: data.len(), 
+                                wanted_index: usize::try_from(*index).unwrap() 
+                            }, ast.positions[right.0]));
+                    }
+
+                    let index: usize = (*index).try_into().unwrap();
+                    Ok(data[index])
+                    
+                }
+                _ => Err((EvalError::InvalidAccessType(ast.get_type(obj_id)), ast.positions[left.0]))
+            }
+        }
+        Type::MatchFunction => {
+            let Node::MatchFunction { data} = &ast.nodes[root] else {
+                unreachable!();
+            };
+
+            let Some(argument) = ctx.args.pop() else {
+                return Err((EvalError::NoArgumentsGivenToFunction, node_pos));
+            };
+
+            // Get the requested match case
+            let wanted_case = &ast.nodes[argument.0];
+
+            for assignment in data {
+                let Node::MatchCase { left, right } = ast.nodes[*assignment] else {
+                    unreachable!();
+                };
+
+                let curr_case = &ast.nodes[left.0];
+
+                // Check if this match case matches the wanted argument
+                if curr_case == wanted_case {
+                    return Ok(right);
+                }
+            }
+
+            let mut all_cases = Vec::new();
+            for assignment in data {
+                let Node::MatchCase { left, .. } = ast.nodes[*assignment] else {
+                    unreachable!();
+                };
+
+                let curr_case = &ast.nodes[left.0];
+                all_cases.push(curr_case.clone());
+            }
+
+            Err((EvalError::MatchCaseNotFound(wanted_case.clone(), all_cases), ast.positions[argument.0]))
         }
         Type::Int
         | Type::Float
@@ -1456,7 +1617,6 @@ pub fn eval(
             // Base case.. Return the node as is. Nothing more to evaluate
             Ok(root)
         }
-
     }
     
 }
@@ -2146,8 +2306,6 @@ pub fn _parse(
                     let next_token = tokens[*token_index];
                     let case= _parse(tokens, token_index, input, ast, 0)?;
 
-                    dbg!(&ast.nodes[case]);
-
                     match ast.nodes.get(case.0) {
                         Some(Node::Function { arg: name, body }) => {
                             // Replace the Function with a MatchCase node
@@ -2591,7 +2749,7 @@ pub fn token_length(input: &str) -> Result<usize, (TokenError, usize)> {
             let mut id = TokenId::Int;
 
             // Read all digits and potential '.' for floats
-            while matches!(input[index], b'0'..=b'9' | b'.') {
+            while index < input.len() && matches!(input[index], b'0'..=b'9' | b'.') {
                 if input[index] == b'.' {
                     if id == TokenId::Float {
                         return Err((TokenError::FloatWithMultipleDecimalPoints, index));
@@ -2611,7 +2769,7 @@ pub fn token_length(input: &str) -> Result<usize, (TokenError, usize)> {
             index += 1;
 
             // Skip over all characters allowed in a name
-            while matches!(input[index], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'$' | b'_' | b'\'')
+            while index < input.len() && matches!(input[index], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'$' | b'_' | b'\'')
             {
                 // Explicitly disallow quotes in the variable
                 if !allow_quotes && input[index] == b'\'' {
@@ -2690,17 +2848,20 @@ mod tests {
             println!("{i}: {node:?}");
         }
 
+        ast.dump_dot(curr_result, "/tmp/dump_after").unwrap();
+
         dbg!(curr_result);
 
         let curr_result = ast.nodes[curr_result].clone();
         assert_eq!(curr_result, wanted_result);
 
+
         let mut res_env = HashMap::new();
         for (key, value) in result_env {
             res_env.insert(key.to_string(), *value);
         }
-        assert_eq!(ctx.env, res_env);
 
+        assert_eq!(ctx.env, res_env);
 
         Ok(())
     }
@@ -5218,7 +5379,7 @@ mod tests {
     #[test]
     fn test_eval_exp_floor_int_vs_float() {
         impl_err_test!("2.0 ^ 3",
-            (EvalError::InvalidNodeTypes(Node::Exp { left: NodeId(0), right: NodeId(1) }), 4)
+            (EvalError::InvalidNodeTypes(Type::Exp), 4)
         );
     }
 
@@ -5235,7 +5396,7 @@ mod tests {
     #[test]
     fn test_eval_mod_floor_int_vs_float() {
         impl_err_test!("8 % 2.0",
-            (EvalError::InvalidNodeTypes(Node::Mod { left: NodeId(0), right: NodeId(1) }), 2)
+            (EvalError::InvalidNodeTypes(Type::Mod), 2)
         );
     }
 
@@ -5266,10 +5427,10 @@ mod tests {
     #[test]
     fn test_eval_equal_floor_int_vs_float() {
         impl_err_test!("8 == 2.0",
-            (EvalError::InvalidNodeTypes(Node::Equal { left: NodeId(0), right: NodeId(1) }), 2)
+            (EvalError::InvalidNodeTypes(Type::Equal), 2)
         );
         impl_err_test!("8 /= 2.0",
-            (EvalError::InvalidNodeTypes(Node::NotEqual { left: NodeId(0), right: NodeId(1) }), 2)
+            (EvalError::InvalidNodeTypes(Type::NotEqual), 2)
         );
     }
 
@@ -5499,12 +5660,184 @@ mod tests {
     }
 
     #[test]
-    fn test_eval_function_application_two_args() {
+    fn test_eval_record_evaluates_value_expressions() {
         impl_eval_test_with_env(
-            "(a -> b -> a + b) 3 3",
+            "{ a=1+2 }",
             &[ ],
-            Node::Int { data: 6 },
+            Node::Record{ keys: vec![NodeId(0)], values: vec![NodeId(6)] },
             &[ ]
         ).unwrap();
     }
+
+    #[test]
+    fn test_eval_record_access() {
+        impl_eval_test_with_env(
+            "
+            rec@key2
+            . rec = { a=1, key2=\"x\"}",
+            &[ ],
+            Node::String { data: "x".to_string() },
+            &[ 
+                ("rec".to_string(), NodeId(10))
+            ]
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_eval_record_access_with_invalid_key() {
+        let err = impl_eval_test_with_env(
+            "
+            rec@badkey
+            . rec = { a=1, key2=\"x\"}",
+            &[ ],
+            Node::String { data: "124".to_string() },
+            &[ 
+                ("rec".to_string(), NodeId(10))
+            ]
+        );
+
+        assert_eq!(
+            err, 
+            Err((EvalError::KeyNotFoundInRecord("badkey".to_string()), 17))
+        );
+    }
+
+    #[test]
+    fn test_eval_list_access() {
+        impl_eval_test_with_env(
+            "
+            list@2
+            . list = [1, 2, 3]",
+            &[ ],
+            Node::Int { data: 3 },
+            &[ 
+                ("list".to_string(), NodeId(7))
+            ]
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_eval_list_access_with_strings() {
+        impl_eval_test_with_env(
+            "
+            list@1
+            . list = [\"a\", \"b\", \"c\"]",
+            &[ ],
+            Node::String{ data: "b".to_string() },
+            &[ 
+                ("list".to_string(), NodeId(7))
+            ]
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_eval_list_invalid_access_returns_error() {
+        let err = impl_eval_test_with_env(
+            "
+            list@key2
+            . list = [1, 2, 3]",
+            &[ ],
+            Node::String { data: "x".to_string() },
+            &[ 
+            ]
+        );
+
+        assert_eq!(
+            err, 
+            Err((EvalError::InvalidListAccessType(Type::Var), 18))
+        );
+    }
+
+    #[test]
+    fn test_eval_list_index_out_of_bounds() {
+        let err = impl_eval_test_with_env(
+            "
+            list@999
+            . list = [1, 2, 3]",
+            &[ ],
+            Node::String { data: "x".to_string() },
+            &[ 
+            ]
+        );
+
+        assert_eq!(
+            err, 
+            Err((EvalError::ListIndexOutOfBounds { length: 3, wanted_index: 999 }, 18))
+        );
+    }
+
+    #[test]
+    fn test_match_int_with_equal_int_matches() {
+        impl_eval_test_with_env(
+            "
+            func 1 
+            . func = | 1 -> 2",
+            &[ ],
+            Node::Int { data: 2 },
+            &[ 
+                ("func".to_string(), NodeId(7))
+            ]
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_match_int_with_equal_int_fail_matches_return_error() {
+        let err = impl_eval_test_with_env(
+            "
+            func 999
+            . func = | 1 -> 2",
+            &[ ],
+            Node::Int { data: 2 },
+            &[ 
+                ("func".to_string(), NodeId(7))
+            ]
+        );
+
+        assert_eq!(
+            err, 
+            Err((EvalError::MatchCaseNotFound(Node::Int { data: 999 }, vec![Node::Int { data: 1 }]), 18))
+        );
+    }
+
+    #[test]
+    fn test_match_int_with_multiple_cases() {
+        impl_eval_test_with_env(
+            "
+            func 3
+            . func = 
+                | 1 -> 2
+                | 2 -> 3
+                | 3 -> 4
+            ",
+            &[ ],
+            Node::Int { data: 4 },
+            &[ 
+                ("func".to_string(), NodeId(13))
+            ]
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_match_int_with_equal_int_fail_matches_return_error2() {
+        let err = impl_eval_test_with_env(
+            "
+            func 999
+            . func = 
+                | 1 -> 2
+                | 2 -> 3
+                | 3 -> 4
+            ",
+            &[ ],
+            Node::Int { data: 2 },
+            &[ 
+                ("func".to_string(), NodeId(7))
+            ]
+        );
+
+        assert_eq!(
+            err, 
+            Err((EvalError::MatchCaseNotFound(Node::Int { data: 999 }, vec![1.into(), 2.into(), 3.into()]), 18))
+        );
+    }
+
 }
