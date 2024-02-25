@@ -441,6 +441,7 @@ pub enum Type {
     Int,
     Float,
     String,
+    Bytes,
     Var,
     List,
     Add,
@@ -464,6 +465,7 @@ pub enum Type {
     Record ,
     Access,
     MatchFunction,
+    Compose,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -706,6 +708,18 @@ pub fn is_valid_base85_byte(c: u8) -> bool {
 #[must_use]
 pub fn is_valid_base64_byte(c: u8) -> bool {
     matches!(c, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'=')
+}
+
+/// Returns `true` for a valid base32 character and `false` otherwise
+#[must_use]
+pub fn is_valid_base32_byte(c: u8) -> bool {
+    matches!(c, b'A'..=b'Z' | b'2'..=b'7' | b'=')
+}
+
+/// Returns `true` for a valid base16 character and `false` otherwise
+#[must_use]
+pub fn is_valid_base16_byte(c: u8) -> bool {
+    c.is_ascii_hexdigit()
 }
 
 impl SyntaxTree {
@@ -1016,6 +1030,8 @@ impl SyntaxTree {
             Node::Record { .. } => Type::Record,
             Node::Access{ .. } => Type::Access,
             Node::MatchFunction { .. } => Type::MatchFunction,
+            Node::Compose { .. } => Type::Compose,
+            Node::Bytes { .. } => Type::Bytes,
             x => unimplemented!("Unknown type for node: {x:?}"),
             
         }
@@ -1231,7 +1247,43 @@ pub fn eval(
                         return Err((EvalError::InvalidNodeTypes(ast.get_type(var_node_id)), ast.positions[root.0]));
                     };
 
-                    Ok(ast.int(var_num + number, node_pos))
+                    let left_int = var_num;
+                    let right_int = *number;
+
+                    // Calculate answer based on node type
+                    let result= match node_type {
+                        Type::Add =>  left_int + right_int ,
+                        Type::Sub =>  left_int - right_int ,
+                        Type::Mul =>  left_int * right_int ,
+                        Type::Mod =>  left_int % right_int ,
+                        Type::Equal { .. } | Type::NotEqual { .. }=> {
+                            let mut result = left_int == right_int;
+
+                            // Invert the result for not equal
+                            if matches!(node_type, Type::NotEqual { .. }) {
+                                result = !result;
+                            }
+
+                            if result {
+                                return Ok(ast.true_node(node_pos));
+                            } 
+
+                            return Ok(ast.false_node(node_pos));
+                        }
+                        Type::Div { .. } | Type::FloorDiv { .. } =>  left_int / right_int,
+                        Type::Exp { .. } =>  {
+                            let Ok(right) = right_int.try_into() else {
+                                return Err((EvalError::ExponentPowerTooLarge(right_int), ast.positions[right.0]));
+                            };
+
+                            dbg!(left_int);
+                            dbg!(right);
+                            left_int.pow(right)
+                        }
+                        _ => unreachable!("{:?}", ast.nodes[root])
+                    };
+
+                    Ok(ast.int(result, node_pos))
                 }
                 (Node::Var { data: var_left }, Node::Var { data: var_right }) => {
                     // a + b
@@ -1323,6 +1375,21 @@ pub fn eval(
 
             // Add this argument to the environment
             ctx.env.insert(arg_name.clone(), argument);
+
+            // Special case where the body of a function is just a variable
+            if let Node::Var { data } = &ast.nodes[body] {
+                let Some(var) = ctx.env.get(data) else {
+                    return Err((EvalError::VariableNotFoundInScope(data.clone()), ast.positions[body.0]));
+                    
+                };
+
+                let var = *var;
+
+                // Add this argument to the environment
+                ctx.env.remove(&arg_name);
+
+                return Ok(var);
+            }
 
             // Evaluate the function using the new environment
             let evaluated = eval(ctx, ast, body)?;
@@ -1606,10 +1673,25 @@ pub fn eval(
 
             Err((EvalError::MatchCaseNotFound(wanted_case.clone(), all_cases), ast.positions[argument.0]))
         }
+        Type::Compose => {
+            let Node::Compose { left, right } = ast.nodes[root] else {
+                unreachable!();
+            };
+
+            let left_data_id = eval(ctx, ast, left)?;
+
+            // Use the result from the first function as input to the second
+            ctx.args.push(left_data_id);
+
+            let result = eval(ctx, ast, right)?;
+
+            Ok(result)
+        }
         Type::Int
         | Type::Float
         | Type::Var
         | Type::String
+        | Type::Bytes
         | Type::Hole 
         | Type::True
         | Type::False
@@ -2165,8 +2247,8 @@ pub fn _parse(
             TokenId::Base64 => {
                 use base64::Engine;
 
-                let name = &input[input_index..=end_input_index];
                 continue_while!(is_valid_base64_byte);
+                let name = &input[input_index..=end_input_index];
 
                 // Decode the base64 string
                 let bytes = base64::engine::general_purpose::STANDARD
@@ -2175,6 +2257,34 @@ pub fn _parse(
 
                 // Create the decoded bytes string
                 ast.bytes(bytes, input_index.try_into().unwrap())
+            }
+            TokenId::Base32 => {
+                use data_encoding::BASE32;
+
+                continue_while!(is_valid_base32_byte);
+                let name = &input[input_index..=end_input_index];
+
+                let mut bytes= vec![0; BASE32.decode_len(name.len()).unwrap()];
+
+                let len = BASE32.decode_mut(name.as_bytes(), &mut bytes).unwrap();
+
+                // Create the decoded bytes string
+                ast.bytes(bytes[..len].to_vec(), input_index.try_into().unwrap())
+            }
+            TokenId::Base16 => {
+                todo!();
+
+                use data_encoding::BASE32;
+
+                continue_while!(is_valid_base16_byte);
+                let name = &input[input_index..=end_input_index];
+
+                let mut bytes= vec![0; BASE32.decode_len(name.len()).unwrap()];
+
+                let len = BASE32.decode_mut(name.as_bytes(), &mut bytes).unwrap();
+
+                // Create the decoded bytes string
+                ast.bytes(bytes[..len].to_vec(), input_index.try_into().unwrap())
             }
             TokenId::LeftBracket => {
                 // Parse a list
@@ -5838,6 +5948,170 @@ mod tests {
             err, 
             Err((EvalError::MatchCaseNotFound(Node::Int { data: 999 }, vec![1.into(), 2.into(), 3.into()]), 18))
         );
+    }
+
+    #[test]
+    fn test_eval_compose() {
+        impl_eval_test_with_env(
+            "
+            ((a -> a + 1) >> (b -> b * 2)) 3
+            ",
+            &[ ],
+            Node::Int { data: 8 },
+            &[ 
+            ]
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_eval_compose_does_not_expose_internal_bbb() {
+        let err = impl_eval_test_with_env(
+            "
+            f 3 . f = ((y -> bbb) >> (z -> aaa))
+            ",
+            &[ ],
+            Node::Int { data: 8 },
+            &[ 
+            ]
+        );
+
+        assert_eq!(
+            err, 
+            Err((EvalError::VariableNotFoundInScope("bbb".to_string()), 30))
+        );
+        
+    }
+
+    #[test]
+    fn test_eval_compose_does_not_expose_internal_aaa() {
+        let err = impl_eval_test_with_env(
+            "
+            f 3 . f = ((y -> y) >> (z -> aaa))
+            ",
+            &[ ],
+            Node::Int { data: 8 },
+            &[ 
+            ]
+        );
+
+        assert_eq!(
+            err, 
+            Err((EvalError::VariableNotFoundInScope("aaa".to_string()), 42))
+        );
+        
+    }
+
+    #[test]
+    fn test_eval_compose_into_funciton() {
+        impl_eval_test_with_env(
+            "
+            f 3 . f = ((y -> y) >> (z -> z))
+            ",
+            &[ ],
+            Node::Int { data: 3 },
+            &[ 
+                ("f".to_string(), NodeId(10))
+            ]
+        ).unwrap();
+       
+    }
+
+    #[test]
+    fn test_double_compose() {
+        impl_eval_test_with_env(
+            "
+            ((a -> a + 1) >> (x -> x) >> (b -> b * 2)) 3
+            ",
+            &[ ],
+            Node::Int { data: 8 },
+            &[ 
+            ]
+        ).unwrap();
+       
+    }
+
+    #[test]
+    fn test_reverse_compose() {
+        impl_eval_test_with_env(
+            "
+            ((a -> a + 1) << (b -> b * 2)) 3
+            ",
+            &[ ],
+            Node::Int { data: 7 },
+            &[ 
+            ]
+        ).unwrap();
+       
+    }
+
+    #[test]
+    fn test_bytes_return_bytes() {
+        impl_eval_test_with_env(
+            "
+            ~~QUJD
+            ",
+            &[ ],
+            Node::Bytes { data: vec![b'A', b'B', b'C'] },
+            &[ 
+            ]
+        ).unwrap();
+       
+    }
+
+    #[test]
+    fn test_bytes_base85_return_bytes() {
+        impl_eval_test_with_env(
+            "
+            ~~85'K|(_
+            ",
+            &[ ],
+            Node::Bytes { data: vec![b'A', b'B', b'C'] },
+            &[ 
+            ]
+        ).unwrap();
+       
+    }
+
+    #[test]
+    fn test_bytes_base64_return_bytes() {
+        impl_eval_test_with_env(
+            "
+            ~~64'QUJD
+            ",
+            &[ ],
+            Node::Bytes { data: vec![b'A', b'B', b'C'] },
+            &[ 
+            ]
+        ).unwrap();
+       
+    }
+
+    #[test]
+    fn test_bytes_base32_return_bytes() {
+        impl_eval_test_with_env(
+            "
+            ~~32'IFBEG===
+            ",
+            &[ ],
+            Node::Bytes { data: vec![b'A', b'B', b'C'] },
+            &[ 
+            ]
+        ).unwrap();
+       
+    }
+
+    #[test]
+    fn test_bytes_base16_return_bytes() {
+        impl_eval_test_with_env(
+            "
+            ~~16'414243
+            ",
+            &[ ],
+            Node::Bytes { data: vec![b'A', b'B', b'C'] },
+            &[ 
+            ]
+        ).unwrap();
+       
     }
 
 }
