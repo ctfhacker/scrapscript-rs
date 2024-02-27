@@ -219,8 +219,8 @@ impl TokenId {
             OpMatchCase => Some((42, 42)),
             OpHasType => Some((41, 41)),
             OpAssign => Some((40, 40)),
+            OpAssert => Some((32, 31)),
             OpWhere => Some((31, 30)),
-            OpAssert => Some((30, 29)),
             OpRightEval => Some((29, 29)),
             Comma => Some((10, 10)),
             OpSpread => Some((0, 0)),
@@ -1537,6 +1537,8 @@ pub fn eval(
             // Add the found scope's env into the global scope
             ctx.env.extend(local_scope.env);
 
+            dbg!(&ctx);
+
             Ok(left_data)
         }
         Type::Assert => {
@@ -1616,6 +1618,7 @@ pub fn eval(
             let left_data = ast.get(left_data_id);
             let right_data = ast.get(right_data_id);
 
+            /*
             let Node::Var { data: obj_name } = left_data else {
                 return Err((EvalError::AccessObjectNotFound, ast.positions[left.0]));
             };
@@ -1623,9 +1626,11 @@ pub fn eval(
             let Some(obj_id) = ctx.env.get(obj_name) else {
                 return Err((EvalError::VariableNotFoundInScope(obj_name.clone()), ast.positions[left.0]));
             };
+            */
 
-            let obj = ast.get(*obj_id);
-            match obj {
+            // let obj = ast.get(*obj_id);
+
+            match left_data {
                 Node::Record { keys, values } => {
                     let Node::Var { data: wanted_key} = right_data else {
                         unreachable!();
@@ -1664,7 +1669,7 @@ pub fn eval(
                     Ok(data[index])
                     
                 }
-                _ => Err((EvalError::InvalidAccessType(ast.get_type(obj_id)), ast.positions[left.0]))
+                _ => Err((EvalError::InvalidAccessType(ast.get_type(&left_data_id)), ast.positions[left.0]))
             }
         }
         Type::MatchFunction => {
@@ -1718,9 +1723,20 @@ pub fn eval(
 
             Ok(result)
         }
+        Type::Var => {
+            let Node::Var { data } = &ast.nodes[root] else {
+                unreachable!();
+            };
+
+            let Some(var_node) = ctx.env.get(data) else {
+                // return Err((EvalError::VariableNotFoundInScope(data.to_string()), node_pos));
+                return Ok(root);
+            };
+
+            Ok(eval(ctx, ast, *var_node)?)
+       }
         Type::Int
         | Type::Float
-        | Type::Var
         | Type::String
         | Type::Bytes
         | Type::Hole 
@@ -2329,7 +2345,6 @@ pub fn _parse(
 
                     while !matches!(tokens[*token_index].id, TokenId::RightBracket) {
                         let next_token = tokens[*token_index];
-                        println!("Next token in bracket: {next_token:?}");
 
                         if matches!(next_token.id, TokenId::EndOfFile) {
                             *token_index += 1;
@@ -2351,8 +2366,6 @@ pub fn _parse(
                         // dbg!(&ast.nodes[token]);
 
                         prev_token = next_token.id; 
-
-                        println!("Next token in bracket2: {:?}", tokens[*token_index].id);
                     }
 
                     if !matches!(tokens[*token_index].id, TokenId::RightBracket) {
@@ -2389,7 +2402,6 @@ pub fn _parse(
                     // Nothing to do, return an empty record
                 } else {
                     while !matches!(tokens[*token_index].id, TokenId::RightBrace) {
-                        println!("Next token in brace: {:?}", tokens[*token_index]);
                         let next_token = tokens[*token_index];
                         dbg!(&next_token);
 
@@ -2492,7 +2504,6 @@ pub fn _parse(
             // If the next prescedence is less than the current, return out of the loop
             // There are two values given for precedence. 
             if checked < current_precedence {
-                println!("Found smaller.. bailing");
                 return Ok(left);
             }
 
@@ -3007,6 +3018,36 @@ mod tests {
         }
 
         assert_eq!(ctx.env, res_env);
+
+        Ok(())
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn end_to_end_test(input: &'static str,  wanted_result: Node) -> Result<(), (EvalError, u32)> {
+        let (root, mut ast) = parse_str(input).unwrap();
+
+        ast.dump_dot(root, "/tmp/dump").unwrap();
+
+        let mut ctx = Context::default();
+        let curr_result = match eval(&mut ctx, &mut ast, root) {
+            Ok(result) => result,
+            Err((err, loc)) => {
+                print_error(input, &Error::Eval((err.clone(), loc.try_into().unwrap())));
+                return Err((err, loc));
+            }
+        };
+
+        println!("--- AST ---");
+        for (i, node) in ast.nodes.iter().enumerate() {
+            println!("{i}: {node:?}");
+        }
+
+        ast.dump_dot(curr_result, "/tmp/dump_after").unwrap();
+
+        dbg!(curr_result);
+
+        let curr_result = ast.nodes[curr_result].clone();
+        assert_eq!(curr_result, wanted_result);
 
         Ok(())
     }
@@ -4691,7 +4732,7 @@ mod tests {
     }
 
     #[test]
-    fn test_function_application_two_args() {
+    fn test_parse_function_application_two_args() {
         let input = "f a b";
         let (_root, ast ) = parse_str(input).unwrap();
 
@@ -6236,6 +6277,211 @@ mod tests {
             Node::List{ data: vec![NodeId(0), NodeId(1), NodeId(3), NodeId(5)]},
             &[ 
             ]
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_empty_list() {
+        impl_eval_test_with_env(
+            "
+            []
+            ",
+            &[ ],
+            Node::List{ data: vec![]},
+            &[ 
+            ]
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_list_of_ints() {
+        impl_eval_test_with_env(
+            "
+            [1, 2, 3]
+            ",
+            &[ ],
+            Node::List{ data: vec![NodeId(0), NodeId(1), NodeId(2)]},
+            &[ 
+            ]
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_list_of_exprs() {
+        impl_eval_test_with_env(
+            "
+            [1+2, 3+4]
+
+            ",
+            &[ ],
+            Node::List { data: vec![ NodeId(7), NodeId(8), ]},
+            &[ 
+            ]
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_where() {
+        end_to_end_test(
+            "
+            a + 2
+            . a = 1
+            ",
+            Node::Int { data: 3 },
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_nested_where() {
+        end_to_end_test(
+            "
+            a + b
+            . a = 1
+            . b = 4
+            ",
+            Node::Int { data: 5 },
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_assert_with_truthy_cond_returns_value() {
+        end_to_end_test(
+            "
+            a + 1 ? a == 1
+            . a = 1
+            ",
+            Node::Int { data: 2 },
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_assert_with_falsey_cond_returns_assertion() {
+        let err = end_to_end_test(
+            "
+            a + 1 ? a == 2
+            . a = 1
+            ",
+            Node::Int { data: 2 },
+        );
+
+        assert_eq!(err, Err((EvalError::FalseConditionFound, 23)));
+    }
+
+    #[test]
+    fn test_nested_assert() {
+        end_to_end_test(
+            "
+            a + b ? a == 1 ? b == 2
+            . a = 1
+            . b = 2
+            ",
+            Node::Int { data: 3 },
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_hole() {
+        end_to_end_test(
+            "()",
+            Node::Hole,
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_bindings_behave_like_letstar() {
+        end_to_end_test(
+            "
+            b
+            . a = 1
+            . b = a
+            ",
+            Node::Int { data: 1 },
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_function_application_two_args() {
+        end_to_end_test(
+            "
+            (a -> b -> a + b) 8 1
+            ",
+            Node::Int { data: 9 },
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_function_create_list_correct_order() {
+        end_to_end_test(
+            "
+            (a -> b -> [a, b]) 3 2
+            ",
+            Node::List { data: vec![NodeId(7), NodeId(9)] },
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_create_record() {
+        end_to_end_test(
+            "
+            { a = 1 + 4 }
+            ",
+            Node::Record { keys: vec![NodeId(0)], values: vec![NodeId(6)] },
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_access_record() {
+        end_to_end_test(
+            "
+            rec@b
+            . rec =  { a = 1 + 4, b = \"x\" }
+            ",
+            Node::String { data: "x".to_string() },
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_access_list() {
+        end_to_end_test(
+            "
+            xs@1
+            . xs =  [0, 1, 2, 3, 4]
+            ",
+            Node::Int { data: 1 },
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_access_list_expr() {
+        end_to_end_test(
+            "
+            xs@(1+1)
+            . xs =  [0, 1, 2, 3, 4]
+            ",
+            Node::Int { data: 2 },
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_access_list_var() {
+        end_to_end_test(
+            "
+            xs@y
+            . xs = [0, 1, 2, 3, 4]
+            . y  = 4
+            ",
+            Node::Int { data: 4 },
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_functions_eval_arguments() {
+        end_to_end_test(
+            "
+            (x -> x) c
+            . c = 1
+            ",
+            Node::Int { data: 4 },
         ).unwrap();
     }
 }
