@@ -208,7 +208,8 @@ impl TokenId {
             OpExp => Some((130, 130)),
             OpMul | OpDiv | OpFloorDiv | OpMod => Some((120, 120)),
             OpSub | OpAdd => Some((110, 110)),
-            OpListCons | OpListAppend | OpStrConcat => Some((100, 100)),
+            OpListCons | OpStrConcat => Some((100, 100)),
+            OpListAppend => Some((100, 99)),
             OpEqual | OpNotEqual | OpLess | OpGreater | OpLessEqual | OpGreaterEqual => Some((90, 90)),
             OpAnd => Some((80, 80)),
             OpOr => Some((70, 70)),
@@ -539,7 +540,7 @@ pub enum TokenError {
     UnquotedEndOfString,
     UnexpectedEndOfFile,
     InvalidSymbol,
-    UnknownCharacter(char)
+    UnknownCharacter(char),
 }
 
 #[derive(Debug)]
@@ -582,7 +583,10 @@ pub enum ParseError {
     NonIntFloatForSubtract,
 
     /// Different types found for the same list
-    ListTypeMismatch(TokenId, TokenId)
+    ListTypeMismatch(TokenId, TokenId),
+
+    /// Invalid function type given to apply
+    InvalidFunctionTypeInApply(Type),
 }
 
 macro_rules! impl_from_err {
@@ -1052,7 +1056,7 @@ pub enum EvalError {
     InvalidNodeTypes(Type),
     ExponentPowerTooLarge(i64),
     NonStringFoundInStringConcat(Node),
-    ListTypeMismatch(Node),
+    ListTypeMismatch(Type),
 
     /// The name of a function was not a `Var`
     InvalidFunctionName,
@@ -1430,18 +1434,44 @@ pub fn eval(
             // let right_data = eval(ctx, ast, right)?;
 
             // let left_data = ast.get(left_data);
-            let right_data = ast.get(right);
+            let right_type = ast.get_type(&right);
 
-            if let Node::List { data  } = right_data {
-                let mut results = vec![left];
+            match right_type {
+                Type::List => {
+                    let Node::List { data } = ast.get(right) else {
+                        unreachable!();
+                    };
 
-                for d in data {
-                    results.push(*d);
+                    let mut results = vec![left];
+
+                    for d in data {
+                        results.push(*d);
+                    }
+
+                    Ok(ast.list(results, node_pos))
                 }
+                Type::ListCons => {
+                    dbg!(right);
+                    let Node::ListCons { left: left_inner, right: right_inner } = ast.get(right).clone() else {
+                        unreachable!();
+                    };
 
-                Ok(ast.list(results, node_pos))
-            } else {
-                Err((EvalError::ListTypeMismatch(right_data.clone()), ast.positions[right.0]))
+                    let right_data= eval(ctx, ast, right_inner)?;
+                    dbg!(&ast.nodes[right_data]);
+
+
+                    let Node::List { data } = ast.get(right_data) else {
+                        unreachable!();
+                    };
+
+                    let mut results = vec![left, left_inner];
+                    results.extend(data);
+
+                    Ok(ast.list(results, node_pos))
+                }
+                _ => {
+                    Err((EvalError::ListTypeMismatch(right_type), ast.positions[right.0]))
+                }
             }
         }
         Type::ListAppend  => {
@@ -1450,21 +1480,22 @@ pub fn eval(
             };
 
             let left_data = eval(ctx, ast, left)?;
-            let right_data = eval(ctx, ast, right)?;
+            let left_type = ast.get_type(&left_data);
 
-            let left_data = ast.get(left_data);
-            let right_data = ast.get(right_data);
+            match left_type {
+                Type::List => {
+                    let Node::List { data } = ast.get(left_data) else {
+                        unreachable!();
+                    };
 
-            if let Node::List { data } = left_data {
-                let mut new_data = data.clone();
-                new_data.push(right);
-                return Ok(ast.list(new_data, node_pos));
+                    let mut new_data = data.clone();
+                    new_data.push(right);
+                    Ok(ast.list(new_data, node_pos))
+                }
+                _ => {
+                    Err((EvalError::ListTypeMismatch(left_type), ast.positions[left.0]))
+                }
             }
-
-
-            dbg!(&left_data);
-            dbg!(&right_data);
-            todo!()
         }
         Type::List => {
             let mut results = Vec::new();
@@ -2272,21 +2303,20 @@ pub fn _parse(
                 ast.bytes(bytes[..len].to_vec(), input_index.try_into().unwrap())
             }
             TokenId::Base16 => {
-                todo!();
-
-                use data_encoding::BASE32;
-
                 continue_while!(is_valid_base16_byte);
-                let name = &input[input_index..=end_input_index];
+                let bytes = &input[input_index..=end_input_index];
 
-                let mut bytes= vec![0; BASE32.decode_len(name.len()).unwrap()];
-
-                let len = BASE32.decode_mut(name.as_bytes(), &mut bytes).unwrap();
+                let bytes = (0..bytes.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&bytes[i..i + 2], 16))
+                    .collect::<Result<Vec<u8>, _>>()
+                    .map_err(|e| (ParseError::Int(e), input_index))?;
 
                 // Create the decoded bytes string
-                ast.bytes(bytes[..len].to_vec(), input_index.try_into().unwrap())
+                ast.bytes(bytes, input_index.try_into().unwrap())
             }
             TokenId::LeftBracket => {
+
                 // Parse a list
                 let mut nodes = Vec::new();
                 let mut prev_token = TokenId::LeftBracket;
@@ -2585,6 +2615,11 @@ pub fn _parse(
             }
 
             let right = _parse(tokens, token_index, input, ast, OPAPPLY_PRECEDENCE + 2)?;
+
+            if !matches!(ast.get_type(&left), Type::Apply | Type::Function | Type::Compose | Type::Var | Type::Sub) {
+                return Err((ParseError::InvalidFunctionTypeInApply(ast.get_type(&left)), ast.positions[left.0] as usize));
+            }
+
             left = ast.apply(left, right, next.pos - 1);
         }
 
@@ -5603,7 +5638,7 @@ mod tests {
 
     #[test]
     fn test_eval_list_cons2() {
-        impl_err_test!("[2, 3] >+ 1", (EvalError::ListTypeMismatch(Node::Int { data: 1}), 10));
+        impl_err_test!("[2, 3] >+ 1", (EvalError::ListTypeMismatch(Type::Int), 10));
     }
 
     #[test]
@@ -6111,7 +6146,96 @@ mod tests {
             &[ 
             ]
         ).unwrap();
-       
     }
 
+    #[test]
+    fn test_int_add_returns_int() {
+        impl_eval_test_with_env(
+            "
+            1 + 2
+            ",
+            &[ ],
+            Node::Int{ data: 3 },
+            &[ 
+            ]
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_int_sub_returns_int() {
+        impl_eval_test_with_env(
+            "
+            1 - 2
+            ",
+            &[ ],
+            Node::Int{ data: -1 },
+            &[ 
+            ]
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_string_concat_returns_string() {
+        impl_eval_test_with_env(
+            "
+            \"abc\" ++ \"def\"
+            ",
+            &[ ],
+            Node::String { data: "abcdef".to_string() },
+            &[ 
+            ]
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_list_cons_returns_list() {
+        impl_eval_test_with_env(
+            "
+            1 >+ [2,3]
+            ",
+            &[ ],
+            Node::List{ data: vec![NodeId(0), NodeId(1), NodeId(2)]},
+            &[ 
+            ]
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_list_cons_nested_returns_list() {
+        impl_eval_test_with_env(
+            "
+            1 >+ 2 >+ [3,4]
+            ",
+            &[ ],
+            Node::List{ data: vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)]},
+            &[ 
+            ]
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_list_append_returns_list() {
+        impl_eval_test_with_env(
+            "
+            [1,2] +< 3
+            ",
+            &[ ],
+            Node::List{ data: vec![NodeId(0), NodeId(1), NodeId(3)]},
+            &[ 
+            ]
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_list_append_nested_returns_list() {
+        impl_eval_test_with_env(
+            "
+            [1,2] +< 3 +< 4
+            ",
+            &[ ],
+            Node::List{ data: vec![NodeId(0), NodeId(1), NodeId(3), NodeId(5)]},
+            &[ 
+            ]
+        ).unwrap();
+    }
 }
