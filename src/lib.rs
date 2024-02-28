@@ -836,6 +836,7 @@ impl SyntaxTree {
         let mut seen_nodes = HashSet::new();
 
         let mut dot = String::from("digraph {\n");
+        dot.push_str("node [shape=record];\n");
 
         while let Some(node_id) = queue.pop() {
             // Ignore nodes we've already seen
@@ -847,7 +848,7 @@ impl SyntaxTree {
 
             // List nodes are special
             if !matches!(curr_node, Node::List {.. } | Node::Record { .. } | Node::MatchFunction { .. }) {
-                dot.push_str(&format!("{node_id} [ label = {:?} ];\n", curr_node.label()));
+                dot.push_str(&format!("node{node_id} [ label = {:?} ];\n", curr_node.label()));
             }
 
             match curr_node {
@@ -880,33 +881,33 @@ impl SyntaxTree {
                     queue.push(*left);
                     queue.push(*right);
 
-                    dot.push_str(&format!("{node_id} -> {left}  [ label=\"left\"; ];\n"));
-                    dot.push_str(&format!("{node_id} -> {right} [ label=\"right\"; ];\n"));
+                    dot.push_str(&format!("node{node_id} -> node{left}  [ label=\"left\"; ];\n"));
+                    dot.push_str(&format!("node{node_id} -> node{right} [ label=\"right\"; ];\n"));
                 }
                 Node::Function { arg: name, body} => {
                     queue.push(*name);
                     queue.push(*body);
 
-                    dot.push_str(&format!("{node_id} -> {name}  [ label=\"name\"; ];\n"));
-                    dot.push_str(&format!("{node_id} -> {body} [ label=\"body\"; ];\n"));
+                    dot.push_str(&format!("node{node_id} -> node{name}  [ label=\"name\"; ];\n"));
+                    dot.push_str(&format!("node{node_id} -> node{body} [ label=\"body\"; ];\n"));
                 }
                 Node::Apply { func, arg } => {
                     queue.push(*func);
                     queue.push(*arg);
 
-                    dot.push_str(&format!("{node_id} -> {func}  [ label=\"func\"; ];\n"));
-                    dot.push_str(&format!("{node_id} -> {arg} [ label=\"arg\"; ];\n"));
+                    dot.push_str(&format!("node{node_id} -> node{func}  [ label=\"func\"; ];\n"));
+                    dot.push_str(&format!("node{node_id} -> node{arg} [ label=\"arg\"; ];\n"));
                 }
                 Node::List { data} => {
                     let label = data
                         .iter()
                         .enumerate().map(|(i, _)| format!("<f{i}> .{i}")).collect::<Vec<_>>().join(" | ");
 
-                    dot.push_str(&format!("node [shape=record]; {node_id} [ label = \"{label}\" ];\n"));
+                    dot.push_str(&format!("node{node_id} [ label = \"{label}\" ];\n"));
 
                     for (i, child_node_id) in data.iter().enumerate() {
                         queue.push(*child_node_id);
-                        dot.push_str(&format!("{node_id}:f{i} -> {child_node_id}\n"));
+                        dot.push_str(&format!("node{node_id}:f{i} -> node{child_node_id}\n"));
                     }
                 }
                 Node::Record { keys, values } => {
@@ -915,11 +916,11 @@ impl SyntaxTree {
                         .enumerate()
                         .map(|(i, value)| format!("<f{i}> .{}", self.nodes[*value].label())).collect::<Vec<_>>().join("|");
 
-                    dot.push_str(&format!("node [shape=record]; {node_id} [ label = \"{label}\" ];\n"));
+                    dot.push_str(&format!("node{node_id} [ label = \"{label}\" ];\n"));
 
                     for (i, child_node_id) in values.iter().enumerate() {
                         queue.push(*child_node_id);
-                        dot.push_str(&format!("{node_id}:f{i} -> {child_node_id};\n"));
+                        dot.push_str(&format!("node{node_id}:f{i} -> node{child_node_id};\n"));
                     }
                 }
                 Node::MatchFunction { data} => {
@@ -934,15 +935,17 @@ impl SyntaxTree {
                             format!("<f{i}> case {}", case.label())
                         }).collect::<Vec<_>>().join(" | ");
 
-                    dot.push_str(&format!("node [shape=record]; {node_id} [ label = \"{label}\" ];\n"));
+                    let label = format!("MATCH | {label}");
+
+                    dot.push_str(&format!("node{node_id} [ label = \"{label}\" ];\n"));
 
                     for (i, child_node_id) in data.iter().enumerate() {
                         let Node::MatchCase { right, .. } = self.nodes[*child_node_id] else {
-                            panic!("Non-matchcase in match function 22");
+                            panic!("Non-matchcase in match function");
                         };
 
                         queue.push(right);
-                        dot.push_str(&format!("{node_id}:f{i} -> {right}\n"));
+                        dot.push_str(&format!("node{node_id}:f{i} -> node{right}\n"));
                     }
                 }
                 Node::Closure { env, expr } => {
@@ -957,8 +960,8 @@ impl SyntaxTree {
                             acc
                         });
 
-                    dot.push_str(&format!("node [shape=record]; {node_id} [ label = \"CLOSURE\nEnv:\n{label}\" ];\n"));
-                    dot.push_str(&format!("{node_id} -> {expr}  [ label=\"expr\"; ];\n"));
+                    dot.push_str(&format!("node [shape=record]; node{node_id} [ label = \"CLOSURE\nEnv:\n{label}\" ];\n"));
+                    dot.push_str(&format!("node{node_id} -> node{expr}  [ label=\"expr\"; ];\n"));
                 }
                 Node::Int { .. } 
                 | Node::Float { .. } 
@@ -1561,18 +1564,24 @@ pub fn eval(
             }
         }
         Type::Apply => {
-            let Node::Apply { func, arg } = ast.nodes[root] else {
+            let Node::Apply { func, arg } = ast.nodes[root].clone() else {
                 unreachable!();
             };
 
             // Add this argument to the current arguments, then evaluate the function
+            let arg = eval(ctx, ast, arg)?;
             ctx.args.push(arg);
+
             dbg!(&ctx);
 
             if let Node::Var { data: keyword } = &ast.nodes[func.0] {
+                dbg!(keyword);
+
                 let Some(target_func) = ctx.env.get(keyword) else {
                     return Err((EvalError::VariableNotFoundInScope(keyword.clone()), ast.positions[func.0]));
                 };
+
+                dbg!(target_func);
 
                 Ok(eval(ctx, ast, *target_func)?)
             } else {
@@ -1689,12 +1698,26 @@ pub fn eval(
                     unreachable!();
                 };
 
+                // Otherwise, check if this exact case matches
                 let curr_case = &ast.nodes[left.0];
+
+                dbg!(&ctx);
+
+                // Variable match case matches everything
+                if let Node::Var { data }  = curr_case {
+                    dbg!(data);
+
+
+                    ctx.env.insert(data.to_string(), argument);
+                   
+                    return eval(ctx, ast, right);
+                }
 
                 // Check if this match case matches the wanted argument
                 if curr_case == wanted_case {
                     return Ok(right);
                 }
+
             }
 
             let mut all_cases = Vec::new();
@@ -6479,9 +6502,106 @@ mod tests {
         end_to_end_test(
             "
             (x -> x) c
-            . c = 1
+            . c = 123
             ",
-            Node::Int { data: 4 },
+            Node::Int { data: 123 },
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_non_var_function_arg_raises_parse_error() {
+        let err = end_to_end_test(
+            "1 -> a",
+            Node::Int { data: 123 },
+        );
+
+        assert_eq!(err, Err((EvalError::InvalidFunctionName, 0)));
+    }
+
+    #[test]
+    fn test_compose() {
+        end_to_end_test(
+            "((a -> a + 1) >> (b -> b * 2)) 3",
+            Node::Int { data: 8 },
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_compose_does_not_expose_internal_x() {
+        let err = end_to_end_test(
+            "
+            f 3
+            . f = ((y -> x) >> (z -> x))
+            ",
+            Node::Int { data: 8 },
+        );
+
+        assert_eq!(err, Err((EvalError::VariableNotFoundInScope("x".to_string()), 42)));
+    }
+
+    #[test]
+    fn test_double_compose_end_to_end() {
+        end_to_end_test(
+            "((a -> a + 1) >> (x -> x) >> (b -> b * 2)) 3",
+            Node::Int { data: 8 },
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_reverse_compose_end_to_end() {
+        end_to_end_test(
+            "((a -> a + 1) << (b -> b * 2)) 3",
+            Node::Int { data: 7 },
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_simple_int_match() {
+        end_to_end_test(
+            "
+            inc 2
+            . inc =
+              | 1 -> 2
+              | 2 -> 3
+            ",
+            Node::Int { data: 3 },
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_match_var_binds_var() {
+        end_to_end_test(
+            "
+            id 3
+            . id =
+              | x -> x
+            ",
+            Node::Int { data: 3 },
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_match_var_binds_var_with_expr() {
+        end_to_end_test(
+            "
+            id 3
+            . id =
+              | x -> x * 4 + 1
+            ",
+            Node::Int { data: 13 },
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_match_var_binds_first_arm() {
+        end_to_end_test(
+            "
+            id 3
+            . id =
+              | x -> x
+              | y -> y * 2
+            ",
+            Node::Int { data: 3 },
         ).unwrap();
     }
 }
