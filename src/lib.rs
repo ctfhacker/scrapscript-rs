@@ -1693,6 +1693,7 @@ pub fn eval(
             // Get the requested match case
             let wanted_case = &ast.nodes[argument.0];
 
+            // Check for the correct match case
             for assignment in data {
                 let Node::MatchCase { left, right } = ast.nodes[*assignment] else {
                     unreachable!();
@@ -1707,10 +1708,17 @@ pub fn eval(
                 if let Node::Var { data }  = curr_case {
                     dbg!(data);
 
-
                     ctx.env.insert(data.to_string(), argument);
-                   
                     return eval(ctx, ast, right);
+                }
+
+
+                if let Node::Record { keys, values} = curr_case {
+                    dbg!(curr_case);
+                    for key in keys {
+                        println!("Key: {:?}", ast.nodes[key.0]);
+                    }
+                    todo!();
                 }
 
                 // Check if this match case matches the wanted argument
@@ -1720,6 +1728,8 @@ pub fn eval(
 
             }
 
+
+            // Match case NOT found.. populate the error result
             let mut all_cases = Vec::new();
             for assignment in data {
                 let Node::MatchCase { left, .. } = ast.nodes[*assignment] else {
@@ -2225,6 +2235,9 @@ pub fn _parse(
             };
         }
 
+        // ast.print_nodes(input);
+        // print_ast(&ast);
+
         // Parse the next leaf token
         let leaf = match start.id {
             TokenId::OpSpread => {
@@ -2386,6 +2399,7 @@ pub fn _parse(
                         let token = _parse(tokens, token_index, input, ast, 20)?;
                         nodes.push(token);
 
+
                         // dbg!(&ast.nodes[token]);
 
                         prev_token = next_token.id; 
@@ -2407,6 +2421,7 @@ pub fn _parse(
                     ast.hole(start.pos)
                 } else {
                     let result =  _parse(tokens, token_index, input, ast, 0)?;
+
 
                     if matches!(tokens[*token_index].id, TokenId::RightParen) {
                         *token_index += 1;
@@ -2460,8 +2475,10 @@ pub fn _parse(
                         }
 
                         prev_token = next_token.id; 
-                        *token_index += 1;
                     }
+            
+                    // Skip over the right brace
+                    *token_index += 1;
                 }
 
                 ast.record(keys, values, input_index.try_into().unwrap())
@@ -2495,6 +2512,10 @@ pub fn _parse(
 
                 ast.match_function(matches, start.pos)
             }
+            TokenId::OpWhere => {
+                todo!()
+                
+            }
             x => return Err((ParseError::UnknownToken(x), start.pos as usize)),
         };
 
@@ -2506,6 +2527,8 @@ pub fn _parse(
     // dbg!(left, &ast.nodes[left]);
 
     loop {
+        // ast.print_nodes(input);
+
         // Check if the left was modified
         let original = left;
 
@@ -2516,6 +2539,7 @@ pub fn _parse(
 
         if matches!(next.id, 
             TokenId::EndOfFile | TokenId::RightBracket | TokenId::RightBrace | TokenId::RightParen | TokenId::OpMatchCase) {
+
             // dbg!(next.id);
             break;
         }
@@ -2534,6 +2558,7 @@ pub fn _parse(
             *token_index += 1;
 
             let right = _parse(tokens, token_index, input, ast, binary_precedence)?;
+
             match binary_op.id {
                 TokenId::EndOfFile => {
                     println!("Hit EOF");
@@ -2649,6 +2674,7 @@ pub fn _parse(
             }
 
             let right = _parse(tokens, token_index, input, ast, OPAPPLY_PRECEDENCE + 2)?;
+
 
             if !matches!(ast.get_type(&left), Type::Apply | Type::Function | Type::Compose | Type::Var | Type::Sub) {
                 return Err((ParseError::InvalidFunctionTypeInApply(ast.get_type(&left)), ast.positions[left.0] as usize));
@@ -6457,6 +6483,7 @@ mod tests {
         end_to_end_test(
             "
             rec@b
+            . badvalue =  { a = 1, b = \"nope\" }
             . rec =  { a = 1 + 4, b = \"x\" }
             ",
             Node::String { data: "x".to_string() },
@@ -6603,5 +6630,37 @@ mod tests {
             ",
             Node::Int { data: 3 },
         ).unwrap();
+    }
+
+    #[test]
+    fn test_match_function_can_close_over_variables() {
+        end_to_end_test(
+            "
+            f 2 10
+            . f = a -> 
+              | b -> a + b
+            ",
+            Node::Int { data: 12 },
+        ).unwrap();
+    }
+
+    #[test]
+    fn test_match_record_binds_var() {
+        end_to_end_test(
+            "get_x rec 
+            . rec = { x = 3 } 
+            . get_x =  
+              | { x = x } -> x",
+            Node::Int { data: 10 },
+        ).unwrap();
+    }
+}
+
+
+
+fn print_ast(ast: &SyntaxTree) {
+    println!("--- AST ---");
+    for (i, node) in ast.nodes.iter().enumerate() {
+        println!("{i}: {node:?}");
     }
 }
