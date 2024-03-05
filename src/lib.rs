@@ -1540,8 +1540,6 @@ pub fn eval(
             // Add the found scope's env into the global scope
             ctx.env.extend(local_scope.env);
 
-            dbg!(&ctx);
-
             Ok(left_data)
         }
         Type::Assert => {
@@ -1572,16 +1570,10 @@ pub fn eval(
             let arg = eval(ctx, ast, arg)?;
             ctx.args.push(arg);
 
-            dbg!(&ctx);
-
             if let Node::Var { data: keyword } = &ast.nodes[func.0] {
-                dbg!(keyword);
-
                 let Some(target_func) = ctx.env.get(keyword) else {
                     return Err((EvalError::VariableNotFoundInScope(keyword.clone()), ast.positions[func.0]));
                 };
-
-                dbg!(target_func);
 
                 Ok(eval(ctx, ast, *target_func)?)
             } else {
@@ -1692,6 +1684,9 @@ pub fn eval(
 
             // Get the requested match case
             let wanted_case = &ast.nodes[argument.0];
+            let wanted_case_type = ast.get_type(&argument);
+
+            println!("Matching: {wanted_case:?}");
 
             // Check for the correct match case
             for assignment in data {
@@ -1700,32 +1695,65 @@ pub fn eval(
                 };
 
                 // Otherwise, check if this exact case matches
-                let curr_case = &ast.nodes[left.0];
+                let curr_check_case = &ast.nodes[left.0];
 
-                dbg!(&ctx);
+                match curr_check_case {
+                    Node::Record { keys: checked_keys, values: checked_values } if wanted_case_type == Type::Record => {
+                        let Node::Record { keys: wanted_keys, values: wanted_values } = wanted_case else {
+                            unreachable!();
+                        };
 
-                // Variable match case matches everything
-                if let Node::Var { data }  = curr_case {
-                    dbg!(data);
+                        let mut found = true;
+                        let mut results = HashSet::new();
 
-                    ctx.env.insert(data.to_string(), argument);
-                    return eval(ctx, ast, right);
-                }
+                        // Iterate over the keys in the wanted case looking for a match in the possible match branches
+                        'next_key: for (index, wanted_key_id) in wanted_keys.iter().enumerate() {
+                            let wanted_key = &ast.nodes[wanted_key_id.0];
 
+                            for checked_key_id in checked_keys {
+                                let checked_key = &ast.nodes[checked_key_id.0];
+                                if checked_key == wanted_key {
+                                    let Node::Var { data} = checked_key else {
+                                        unreachable!();
+                                    };
 
-                if let Node::Record { keys, values} = curr_case {
-                    dbg!(curr_case);
-                    for key in keys {
-                        println!("Key: {:?}", ast.nodes[key.0]);
+                                    let new_value = wanted_values[index];
+                                    results.insert((data.to_string(), wanted_values[index]));
+                                    continue 'next_key;
+                                }
+                            }
+
+                            found = false;
+                            break 'next_key;
+                        }
+
+                        if found {
+                            for (key, val) in results {
+                                ctx.env.insert(key, val);
+                            }
+
+                            println!("{right:?}");
+                            return eval(ctx, ast, right);
+                        }
+                        
+                        dbg!(curr_check_case);
+                        todo!();
                     }
-                    todo!();
-                }
 
-                // Check if this match case matches the wanted argument
-                if curr_case == wanted_case {
-                    return Ok(right);
+                    Node::Int { .. } => {
+                        if wanted_case == curr_check_case {
+                            return Ok(right);
+                        }
+                    }
+                    // Variable match case matches everything
+                    Node::Var { data } => {
+                        ctx.env.insert(data.to_string(), argument);
+                        return eval(ctx, ast, right);
+                    }
+                    x => {
+                        unimplemented!("{x:?}");
+                    }
                 }
-
             }
 
 
@@ -6648,10 +6676,10 @@ mod tests {
     fn test_match_record_binds_var() {
         end_to_end_test(
             "get_x rec 
-            . rec = { x = 3 } 
+            . rec = { x = 5 } 
             . get_x =  
               | { x = x } -> x",
-            Node::Int { data: 10 },
+            Node::Int { data: 5 },
         ).unwrap();
     }
 }
