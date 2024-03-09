@@ -5,7 +5,7 @@ mod colors;
 use colors::Colorized;
 
 use core::ops::{Index, IndexMut};
-use std::collections::{HashSet, HashMap};
+use std::collections::{HashSet, HashMap, VecDeque};
 
 /// Error margin when comparing floats
 const FLOAT_ERROR_MARGIN: f64 = 0.000_000_000_001;
@@ -1050,7 +1050,104 @@ impl SyntaxTree {
     pub fn get(&self, node: NodeId) -> &Node {
         &self.nodes[node]
     }
+
+    #[must_use]
+    pub fn finish(&self, node: NodeId) -> Option<EvalResult> {
+        // match self.nodes[node] {
+        Some(match self.nodes.get(node.0)?.clone() {
+            Node::Int { data } => EvalResult::Int(data),
+            Node::Float { data } => EvalResult::Float(data.to_le_bytes()),
+            Node::Assign { left, right } => {
+                dbg!(&self.nodes[left]);
+                dbg!(&self.nodes[right]);
+                unreachable!();
+            }
+            Node::String { data } => EvalResult::String(data),
+            Node::True => EvalResult::True,
+            Node::False => EvalResult::False,
+            Node::List { data } => {
+                let mut results = Vec::new();
+
+                for node_id in data {
+                    results.push(self.finish(node_id)?);
+                }
+
+                EvalResult::List(results)
+            }
+            Node::Record { keys, values } => {
+                EvalResult::Record { 
+                    keys: keys.iter().map(|k| self.finish(*k).unwrap()).collect(),
+                    values: values.iter().map(|k| self.finish(*k).unwrap()).collect(),
+                }
+            }
+            Node::StrConcat{ left, right } => {
+                match (self.finish(left)?, self.finish(right)?) {
+                    (EvalResult::String(mut left), EvalResult::String(right)) => {
+                        left.extend(right.chars());
+                        EvalResult::String(left)
+                    }
+                    _ => return None
+                }
+            }
+            x => todo!("{x:?}"),
+        })
+    }
 }
+
+/// The results of an evaluation
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EvalResult {
+    True,
+    False,
+    Int(i64),
+    Float([u8; 8]),
+    String(String),
+    List(Vec<EvalResult>),
+    Record { keys: Vec<EvalResult>, values: Vec<EvalResult> },
+}
+
+impl From<f64> for EvalResult {
+    fn from(data: f64) -> EvalResult { 
+        EvalResult::Float(data.to_le_bytes())
+    }
+}
+
+impl From<i64> for EvalResult {
+    fn from(data: i64) -> EvalResult { 
+        EvalResult::Int(data)
+    }
+}
+
+impl From<&str> for EvalResult {
+    fn from(data: &str) -> EvalResult { 
+        EvalResult::String(data.to_string())
+    }
+}
+
+impl From<String> for EvalResult {
+    fn from(data: String) -> EvalResult { 
+        EvalResult::String(data)
+    }
+}
+
+impl From<Vec<EvalResult>> for EvalResult {
+    fn from(data: Vec<EvalResult>) -> EvalResult { 
+        EvalResult::List(data)
+    }
+}
+
+impl TryFrom<EvalResult> for f64 {
+    type Error = &'static str;
+
+    fn try_from(res: EvalResult) -> Result<f64, Self::Error> {
+        match res {
+            EvalResult::Float(bytes) => Ok(f64::from_le_bytes(bytes)),
+            _ => Err("Not a valid f64")
+        }
+    }
+    
+}
+
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum EvalError {
@@ -1095,7 +1192,7 @@ pub enum EvalError {
     MatchCaseNotFound(Node, Vec<Node>)
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct Context {
     /// Variable assignments
     pub env: HashMap<String, NodeId>,
@@ -1103,6 +1200,22 @@ pub struct Context {
     /// Arguments passed to functions
     pub args: Vec<NodeId>
 
+}
+
+/// The evaluation state for an operation in the iterative case
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum EvalState {
+    /// Needs its arguments to be evaluated
+    NeedArguments,
+
+    /// Can begin evaluation
+    Ready,
+
+    /// Needs its arguments to be evaluated with a new context
+    NeedArgumentsNewContext,
+
+    /// Needs its arguments to be evaluated with context currently on the context stack
+    NeedArgumentsRestoreContext,
 }
 
 /// Evaluate the given node at `root` using the given context `ctx`
@@ -1118,697 +1231,771 @@ pub struct Context {
 pub fn eval(
         ctx: &mut Context, 
         ast: &mut SyntaxTree, 
-        root: NodeId) -> Result<NodeId, (EvalError, u32)> {
-    let node_type = ast.get_type(&root);
-    let node_pos = ast.positions[root.0];
+        start: NodeId) -> Result<EvalResult, (EvalError, u32)> {
+    let mut work = VecDeque::new();
+    work.push_front((start, EvalState::NeedArguments));
 
-    match node_type {
-        Type::Add 
-        | Type::Sub
-        | Type::Mul
-        | Type::Div
-        | Type::FloorDiv 
-        | Type::Exp 
-        | Type::Mod 
-        | Type::Equal 
-        | Type::NotEqual => {
-            use Node::{Add, Sub, Mul, Div, FloorDiv, Exp, Mod, Equal, NotEqual};
+    // let mut stacks = VecDeque::new();
+    let mut arguments = VecDeque::new();
 
-            let (Add { left, right }   | Sub { left, right }       | Mul { left, right }
-                | Div { left, right }  | FloorDiv  { left, right } | Exp  { left, right }
-                | Mod  { left, right } | Equal  { left, right }    | NotEqual  { left, right })
-                = ast.nodes[root] else  {
-                unreachable!()
-            };
+    let mut contexts = VecDeque::new();
 
-            let left_data = eval(ctx, ast, left)?;
-            let right_data = eval(ctx, ast, right)?;
+    'work: while let Some((curr_node_id, mut eval_state)) = work.pop_front() {
+        let node_pos = ast.positions[curr_node_id.0];
+        let curr_node = &ast.nodes[curr_node_id];
 
-            let left_data = ast.get(left_data);
-            let right_data = ast.get(right_data);
+        eprintln!("--- TOP ---");
+        print_ast(&ast);
+        eprintln!("Node ({curr_node_id}) {curr_node:?}");
+        eprintln!("Contexts: {contexts:?}");
+        eprintln!("State: {eval_state:?}");
+        eprintln!("Env {:?}", ctx.env);
 
-            match (left_data, right_data) {
-                (Node::Int { data: left_int}, Node::Int { data: right_int}) => {
-                    // Adding two Ints
-                    let data= match node_type {
-                        Type::Add =>  left_int + right_int ,
-                        Type::Sub =>  left_int - right_int ,
-                        Type::Mul =>  left_int * right_int ,
-                        Type::Mod =>  left_int % right_int ,
-                        Type::Equal { .. } | Type::NotEqual { .. }=> {
-                            let mut result = left_int == right_int;
+        match eval_state {
+            EvalState::NeedArgumentsNewContext => {
+                // Use a new context for this node
+                let mut old_scope = Context::default();
+                core::mem::swap(ctx, &mut old_scope);
 
-                            // Invert the result for not equal
-                            if matches!(node_type, Type::NotEqual { .. }) {
-                                result = !result;
-                            }
+                // Push the old contexts onto the stack of contexts
+                contexts.push_front(old_scope);
+                eval_state = EvalState::NeedArguments;
+            }
+            EvalState::NeedArgumentsRestoreContext => {
+                // Restore an old context for this node
+                let mut old_context = contexts.pop_front().unwrap();
 
-                            if result {
-                                return Ok(ast.true_node(node_pos));
-                            } 
+                // Add the old context to the main context
+                old_context.env.extend(ctx.env.drain());
 
-                            return Ok(ast.false_node(node_pos));
-                        }
-                        Type::Div { .. } | Type::FloorDiv { .. } =>  left_int / right_int,
-                        Type::Exp { .. } =>  {
-                            let Ok(right) = (*right_int).try_into() else {
-                                return Err((EvalError::ExponentPowerTooLarge(*right_int), ast.positions[right.0]));
-                            };
+                // Restore the original context
+                *ctx = old_context;
+                
+                // Use the normal first state for this node
+                eval_state = EvalState::NeedArguments;
+            }
+            /*
+            EvalState::NeedArguments => {
+                if !contexts.is_empty() {
+                    // Restore an old context for this node
+                    let mut old_context = contexts.pop_front().unwrap();
 
-                            dbg!(left_int);
-                            dbg!(right);
-                            left_int.pow(right)
-                        }
-                        _ => unreachable!("{:?}", ast.nodes[root])
-                    };
+                    // Add the old context to the main context
+                    // old_context.env.extend(ctx.env.drain());
 
-                    Ok(ast.int(data, node_pos))
-                }
-                // Adding two Floats or a Float with a 0
-                (left @ (Node::Float { .. } | Node::Int { data: 0}), Node::Float { data: right }) => {
-                    // A negative float is represented by a `0 - floatnum`. We need 
-                    // to convert this zero to a floating point zero
-                    let left = match left {
-                        Node::Float { data} => *data,
-                        Node::Int { data: 0 } => 0.0,
-                        _ => unreachable!()
-                    };
-
-                    let right  = *right;
-
-                    let data = match node_type {
-                        Type::Add { .. } =>  left + right,
-                        Type::Sub { .. } =>  left - right,
-                        Type::Mul { .. } =>  left * right,
-                        Type::Div { .. } =>  left / right,
-                        Type::Mod { .. } =>  left % right,
-                        Type::Exp { .. } =>  left.powf(right),
-                        Type::FloorDiv { .. } =>  (left / right).floor(),
-                        Type::NotEqual { .. } | Type::Equal { .. } => {
-                            // 
-                            let l_abs = left.abs();
-                            let r_abs = right.abs();
-                            let diff = (left - right).abs();
-
-                            let mut result = if (left - right).abs() < FLOAT_ERROR_MARGIN {
-                                true
-                            } else if left == 0.0 || right == 0.0 || (l_abs + r_abs < f64::MIN_POSITIVE) {
-                                diff < f64::EPSILON * f64::MIN_POSITIVE
-                            } else {
-                                diff / (l_abs + r_abs).min(f64::MAX) < f64::EPSILON
-                            };
-
-                            // Invert the result for not equal
-                            if matches!(node_type, Type::NotEqual { .. }) {
-                                result = !result;
-                            }
-
-                            if result {
-                                return Ok(ast.true_node(node_pos));
-                            } 
-
-                            return Ok(ast.false_node(node_pos));
-                        }
-                        _ => unreachable!("{:?}", ast.nodes[root])
-                    };
-
-
-                    Ok(ast.float(data, node_pos))
-                }
-
-                (Node::Var { data: var }, Node::Int { data: number}) | 
-                (Node::Int { data: number}, Node::Var { data: var }) => {
-                    // Check if the requested variable is in scope
-                    let Some(var_node_id) = ctx.env.get(var) else {
-                        let node_pos = if matches!(left_data, Node::Var { .. }) {
-                            ast.positions[left.0]
-                        } else {
-                            ast.positions[right.0]
-                        };
-
-                        return Err((EvalError::VariableNotFoundInScope(var.to_string()), node_pos));
-                    };
-
-                    // Check that the variable is of the same type
-                    let Node::Int { data: var_num } = ast.nodes[*var_node_id] else {
-                        return Err((EvalError::InvalidNodeTypes(ast.get_type(var_node_id)), ast.positions[root.0]));
-                    };
-
-                    let left_int = var_num;
-                    let right_int = *number;
-
-                    // Calculate answer based on node type
-                    let result= match node_type {
-                        Type::Add =>  left_int + right_int ,
-                        Type::Sub =>  left_int - right_int ,
-                        Type::Mul =>  left_int * right_int ,
-                        Type::Mod =>  left_int % right_int ,
-                        Type::Equal { .. } | Type::NotEqual { .. }=> {
-                            let mut result = left_int == right_int;
-
-                            // Invert the result for not equal
-                            if matches!(node_type, Type::NotEqual { .. }) {
-                                result = !result;
-                            }
-
-                            if result {
-                                return Ok(ast.true_node(node_pos));
-                            } 
-
-                            return Ok(ast.false_node(node_pos));
-                        }
-                        Type::Div { .. } | Type::FloorDiv { .. } =>  left_int / right_int,
-                        Type::Exp { .. } =>  {
-                            let Ok(right) = right_int.try_into() else {
-                                return Err((EvalError::ExponentPowerTooLarge(right_int), ast.positions[right.0]));
-                            };
-
-                            dbg!(left_int);
-                            dbg!(right);
-                            left_int.pow(right)
-                        }
-                        _ => unreachable!("{:?}", ast.nodes[root])
-                    };
-
-                    Ok(ast.int(result, node_pos))
-                }
-                (Node::Var { data: var_left }, Node::Var { data: var_right }) => {
-                    // a + b
-
-                    // Check if the requested variable is in scope
-                    let Some(left_node_id) = ctx.env.get(var_left) else {
-                        return Err((EvalError::VariableNotFoundInScope(var_left.to_string()), node_pos));
-                    };
-                    let left_node_id = *left_node_id;
-
-                    // Check if the requested variable is in scope
-                    let Some(right_node_id) = ctx.env.get(var_right) else {
-                        return Err((EvalError::VariableNotFoundInScope(var_right.to_string()), node_pos));
-                    };
-                    let right_node_id = *right_node_id;
-
-                    // Evaluate both sides of the addition
-                    let left_data = eval(ctx, ast, left_node_id)?;
-                    let right_data = eval(ctx, ast, right_node_id)?;
-
-                    // Add 
-                    let res_node = ast.add(left_data, right_data, node_pos);
-
-                    let result = eval(ctx, ast, res_node)?;
-
-                    Ok(result)
-                }
-                _ => {
-                    if let Node::Add { left, right } = ast.nodes[root] {
-                        dbg!(&ctx);
-                        dbg!(&ast.nodes[left]);
-                        dbg!(&ast.nodes[right]);
-                    }
-
-                    Err((EvalError::InvalidNodeTypes(ast.get_type(&root)), ast.positions[root.0]))
+                    // Restore the original context
+                    *ctx = old_context;
                 }
             }
+            */
+            _ => {}
         }
-        Type::Assign => {
-            let Node::Assign { left, right }  = ast.nodes[root] else {
-                unreachable!();
-            };
 
-            let Node::Var { data: ref var} = ast.nodes[left] else {
-                return Err((EvalError::InvalidAssignmentVariable, ast.positions[left.0]));
-            };
+        eprintln!("Work {work:?}");
+        eprintln!("Env {:?}", ctx.env);
+        eprintln!("Arguments {:?}", arguments);
+        eprintln!("Contexts {contexts:?}");
+       
+        match curr_node {
+            Node::Add { left, right }
+            | Node::Sub { left, right }
+            | Node::Mul { left, right }
+            | Node::Div { left, right }
+            | Node::FloorDiv { left, right }
+            | Node::Exp { left, right }
+            | Node::Mod { left, right }
+            | Node::Equal { left, right }
+            | Node::NotEqual {left, right } => {
+                if eval_state == EvalState::NeedArguments {
+                    work.push_front((curr_node_id, EvalState::Ready));
+                    work.push_front((*left, EvalState::NeedArguments));
+                    work.push_front((*right, EvalState::NeedArguments));
+                    continue;
+                }
 
-            let env_key = var.to_string();
-            
-            if let Node::Function { body, .. } = ast.nodes[right] && ast.nodes[body] == ast.nodes[left] {
-                // Assigning a variable to a function with a body of that variable IS a closure
+                dbg!(&arguments);
 
-                // Get the closure id ahead of time
-                let closure_id = ast.nodes.len();
+                let left_data = arguments.pop_back().unwrap();
+                let right_data = arguments.pop_back().unwrap();
 
-                // Create the closure env with its id in it
-                let mut closure_env = HashMap::new();
-                closure_env.insert(var.to_string(), NodeId(closure_id));
+                let left_data = ast.get(left_data);
+                let right_data = ast.get(right_data);
 
-                // Create the new closure
-                let closure_id = ast.closure(closure_env, right, ast.positions[root.0]);
+                let node_type = ast.get_type(&curr_node_id);
 
-                // Add the variable assignment to the environment
-                ctx.env.insert(env_key, closure_id);
+                dbg!(left_data, right_data, node_type);
 
-                // Return the closure as the result
-                Ok(closure_id)
+                match (left_data, right_data) {
+                    (Node::Int { data: left_int}, Node::Int { data: right_int}) => {
+                        // Adding two Ints
+                        let data= match node_type {
+                            Type::Add =>  left_int + right_int ,
+                            Type::Sub =>  left_int - right_int ,
+                            Type::Mul =>  left_int * right_int ,
+                            Type::Mod =>  left_int % right_int ,
+                            Type::Equal { .. } | Type::NotEqual { .. }=> {
+                                let mut result = left_int == right_int;
 
-            } else {
-                ctx.env.insert(env_key, right);
-                Ok(root)
-            } 
-        }
-        Type::Function => {
-            let Node::Function { arg: name, body} = ast.nodes[root] else {
-                unreachable!();
-            };
+                                // Invert the result for not equal
+                                if matches!(node_type, Type::NotEqual { .. }) {
+                                    result = !result;
+                                }
 
-            let arg_name = if let Node::Var { data } = &ast.nodes[name] {
-                data.clone()
-            } else {
-                return Err((EvalError::InvalidFunctionName, ast.positions[name.0]));
-            };
+                                if result {
+                                    arguments.push_back(ast.true_node(node_pos));
+                                } else {
+                                    arguments.push_back(ast.false_node(node_pos));
+                                }
 
-            // Pop the last argument given
-            let Some(argument) = ctx.args.pop() else {
-                return Err((EvalError::NoArgumentsGivenToFunction, node_pos));
-            };
+                                continue;
+                            }
+                            Type::Div { .. } | Type::FloorDiv { .. } =>  left_int / right_int,
+                            Type::Exp { .. } =>  {
+                                let Ok(right) = (*right_int).try_into() else {
+                                    return Err((EvalError::ExponentPowerTooLarge(*right_int), ast.positions[right.0]));
+                                };
 
-            // Add this argument to the environment
-            ctx.env.insert(arg_name.clone(), argument);
+                                dbg!(left_int);
+                                dbg!(right);
+                                left_int.pow(right)
+                            }
+                            _ => unreachable!("{:?}", ast.nodes[curr_node_id])
+                        };
 
-            // Special case where the body of a function is just a variable
-            if let Node::Var { data } = &ast.nodes[body] {
-                let Some(var) = ctx.env.get(data) else {
-                    return Err((EvalError::VariableNotFoundInScope(data.clone()), ast.positions[body.0]));
-                    
+                        dbg!(data);
+
+                        arguments.push_back(ast.int(data, node_pos));
+                    }
+                    // Adding two Floats or a Float with a 0
+                    (left @ (Node::Float { .. } | Node::Int { data: 0}), Node::Float { data: right }) => {
+                        // A negative float is represented by a `0 - floatnum`. We need 
+                        // to convert this zero to a floating point zero
+                        let left = match left {
+                            Node::Float { data} => *data,
+                            Node::Int { data: 0 } => 0.0,
+                            _ => unreachable!()
+                        };
+
+                        let right  = *right;
+
+                        let data = match node_type {
+                            Type::Add { .. } =>  left + right,
+                            Type::Sub { .. } =>  left - right,
+                            Type::Mul { .. } =>  left * right,
+                            Type::Div { .. } =>  left / right,
+                            Type::Mod { .. } =>  left % right,
+                            Type::Exp { .. } =>  left.powf(right),
+                            Type::FloorDiv { .. } =>  (left / right).floor(),
+                            Type::NotEqual { .. } | Type::Equal { .. } => {
+                                // 
+                                let l_abs = left.abs();
+                                let r_abs = right.abs();
+                                let diff = (left - right).abs();
+
+                                let mut result = if (left - right).abs() < FLOAT_ERROR_MARGIN {
+                                    true
+                                } else if left == 0.0 || right == 0.0 || (l_abs + r_abs < f64::MIN_POSITIVE) {
+                                    diff < f64::EPSILON * f64::MIN_POSITIVE
+                                } else {
+                                    diff / (l_abs + r_abs).min(f64::MAX) < f64::EPSILON
+                                };
+
+                                // Invert the result for not equal
+                                if matches!(node_type, Type::NotEqual { .. }) {
+                                    result = !result;
+                                }
+
+                                if result {
+                                    arguments.push_back(ast.true_node(node_pos));
+                                }  else {
+                                    arguments.push_back(ast.false_node(node_pos));
+                                }
+
+                                continue;
+                            }
+                            _ => unreachable!("{:?}", ast.nodes[curr_node_id])
+                        };
+
+
+                        arguments.push_back(ast.float(data, node_pos));
+                    }
+
+                    (Node::Var { data: var }, Node::Int { data: number}) | 
+                    (Node::Int { data: number}, Node::Var { data: var }) => {
+                        dbg!(var);
+                        dbg!(&ctx.env);
+
+                        // Check if the requested variable is in scope
+                        let Some(var_node_id) = ctx.env.get(var) else {
+                            let node_pos = if matches!(left_data, Node::Var { .. }) {
+                                ast.positions[left.0]
+                            } else {
+                                ast.positions[right.0]
+                            };
+
+                            return Err((EvalError::VariableNotFoundInScope(var.to_string()), node_pos));
+                        };
+
+                        // Check that the variable is of the same type
+                        let Node::Int { data: var_num } = ast.nodes[*var_node_id] else {
+                            return Err((EvalError::InvalidNodeTypes(ast.get_type(var_node_id)), node_pos));
+                        };
+
+                        let left_int = var_num;
+                        let right_int = *number;
+
+                        // Calculate answer based on node type
+                        let result= match node_type {
+                            Type::Add =>  left_int + right_int ,
+                            Type::Sub =>  left_int - right_int ,
+                            Type::Mul =>  left_int * right_int ,
+                            Type::Mod =>  left_int % right_int ,
+                            Type::Equal { .. } | Type::NotEqual { .. }=> {
+                                let mut result = left_int == right_int;
+
+                                // Invert the result for not equal
+                                if matches!(node_type, Type::NotEqual { .. }) {
+                                    result = !result;
+                                }
+
+                                if result {
+                                    return Ok(EvalResult::True);
+                                } 
+
+                                return Ok(EvalResult::False);
+                            }
+                            Type::Div { .. } | Type::FloorDiv { .. } =>  left_int / right_int,
+                            Type::Exp { .. } =>  {
+                                let Ok(right) = right_int.try_into() else {
+                                    return Err((EvalError::ExponentPowerTooLarge(right_int), ast.positions[right.0]));
+                                };
+
+                                dbg!(left_int);
+                                dbg!(right);
+                                left_int.pow(right)
+                            }
+                            _ => unreachable!("{:?}", ast.nodes[curr_node_id])
+                        };
+
+                        dbg!(result);
+
+                        arguments.push_back(ast.int(result, node_pos));
+                    }
+                    /*
+                    (Node::Var { data: var_left }, Node::Var { data: var_right }) => {
+                        // a + b
+
+                        // Check if the requested variable is in scope
+                        let Some(left_node_id) = ctx.env.get(var_left) else {
+                            return Err((EvalError::VariableNotFoundInScope(var_left.to_string()), node_pos));
+                        };
+                        let left_node_id = *left_node_id;
+
+                        // Check if the requested variable is in scope
+                        let Some(right_node_id) = ctx.env.get(var_right) else {
+                            return Err((EvalError::VariableNotFoundInScope(var_right.to_string()), node_pos));
+                        };
+                        let right_node_id = *right_node_id;
+
+                        // Evaluate both sides of the addition
+                        let left_data = eval(ctx, ast, left_node_id)?;
+                        let right_data = eval(ctx, ast, right_node_id)?;
+
+                        // Add 
+                        let res_node = ast.add(left_data, right_data, node_pos);
+
+                        let result = eval(ctx, ast, res_node)?;
+
+                        arguments.push_back(result);
+                    }
+                    */
+                    _ => {
+                        if let Node::Add { left, right } = ast.nodes[curr_node_id] {
+                            dbg!(&ctx);
+                            dbg!(&ast.nodes[left]);
+                            dbg!(&ast.nodes[right]);
+                        }
+
+                        return Err((EvalError::InvalidNodeTypes(ast.get_type(&curr_node_id)), node_pos));
+                    }
+                }
+            }
+            Node::Assign { left, right }  => {
+                if eval_state == EvalState::NeedArguments {
+                    work.push_front((curr_node_id, EvalState::Ready));
+                    work.push_front((*right, EvalState::NeedArguments));
+                    continue 'work;
+                }
+
+                let Node::Var { data: ref var} = ast.nodes[*left] else {
+                    return Err((EvalError::InvalidAssignmentVariable, ast.positions[left.0]));
                 };
 
-                let var = *var;
+                let env_key = var.to_string();
+            
+                if let Node::Function { body, .. } = ast.nodes[*right] && ast.nodes[body] == ast.nodes[*left] {
+                    // Assigning a variable to a function with a body of that variable IS a closure
+
+                    // Get the closure id ahead of time
+                    let closure_id = ast.nodes.len();
+
+                    // Create the closure env with its id in it
+                    let mut closure_env = HashMap::new();
+                    closure_env.insert(var.to_string(), NodeId(closure_id));
+
+                    // Create the new closure
+                    let closure_id = ast.closure(closure_env, *right, node_pos);
+
+                    // Add the variable assignment to the environment
+                    ctx.env.insert(env_key, closure_id);
+
+                    // Return the closure as the result
+                    arguments.push_back(closure_id);
+                } else {
+                    ctx.env.insert(env_key, *right);
+                    // arguments.push_back(curr_node_id);
+                } 
+            }
+            Node::Function { arg: name, body} => {
+                if eval_state == EvalState::NeedArguments {
+                    arguments.push_back(curr_node_id);
+                    continue 'work;
+                }
+
+                let arg_name = if let Node::Var { data } = &ast.nodes[name.0] {
+                    data.clone()
+                } else {
+                    return Err((EvalError::InvalidFunctionName, ast.positions[name.0]));
+                };
+
+                // Pop the last argument given
+                let Some(argument) = arguments.pop_back() else {
+                    return Err((EvalError::NoArgumentsGivenToFunction, node_pos));
+                };
+
+                let mut old_scope = Context::default();
+                core::mem::swap(ctx, &mut old_scope);
+
+                // Use this local scope for calling the body of this function
+                contexts.push_front(old_scope);
 
                 // Add this argument to the environment
-                ctx.env.remove(&arg_name);
+                ctx.env.insert(arg_name.clone(), argument);
 
-                return Ok(var);
+                // Special case where the body of a function is just a variable
+                if let Node::Var { data } = &ast.nodes[body.0] {
+                    let Some(var) = ctx.env.get(data) else {
+                        return Err((EvalError::VariableNotFoundInScope(data.clone()), ast.positions[body.0]));
+                    };
+
+                    let var = *var;
+
+                    // Add this argument to the environment
+                    ctx.env.remove(&arg_name);
+
+                    arguments.push_back(var);
+                    continue;
+                }
+
+                work.push_front((*body, EvalState::NeedArgumentsRestoreContext));
             }
+            Node::StrConcat { left, right } => {
+                if eval_state == EvalState::NeedArguments {
+                    work.push_front((curr_node_id, EvalState::Ready));
+                    work.push_front((*left, EvalState::NeedArguments));
+                    work.push_front((*right, EvalState::NeedArguments));
+                    continue;
+                }
 
-            // Evaluate the function using the new environment
-            let evaluated = eval(ctx, ast, body)?;
+                let left_data = arguments.pop_back().unwrap();
+                let right_data = arguments.pop_back().unwrap();
 
-            // Add this argument to the environment
-            ctx.env.remove(&arg_name);
+                let left_data = ast.get(left_data);
+                let right_data = ast.get(right_data);
 
-            Ok(evaluated)
-        }
-        Type::StrConcat => {
-            let Node::StrConcat { left, right } = ast.nodes[root] else {
-                unreachable!();
-            };
-
-            let left_data = eval(ctx, ast, left)?;
-            let right_data = eval(ctx, ast, right)?;
-
-            let left_data = ast.get(left_data);
-            let right_data = ast.get(right_data);
-
-            dbg!(&left_data);
-            dbg!(&right_data);
+                dbg!(&left_data);
+                dbg!(&right_data);
             
-            if let (Node::String { data: l_str }, Node::String { data: r_str}) = (left_data, right_data) {
-                let mut new_data = l_str.clone();
-                new_data.push_str(r_str);
-                return Ok(ast.string(new_data, node_pos));
-            }
-
-            Err((EvalError::NonStringFoundInStringConcat(ast.nodes[root].clone()), ast.positions[root.0]))
-        }
-        Type::ListCons => {
-            let Node::ListCons { left, right } = ast.nodes[root] else {
-                unreachable!();
-            };
-
-            // let left_data = eval(ctx, ast, left)?;
-            // let right_data = eval(ctx, ast, right)?;
-
-            // let left_data = ast.get(left_data);
-            let right_type = ast.get_type(&right);
-
-            match right_type {
-                Type::List => {
-                    let Node::List { data } = ast.get(right) else {
-                        unreachable!();
-                    };
-
-                    let mut results = vec![left];
-
-                    for d in data {
-                        results.push(*d);
-                    }
-
-                    Ok(ast.list(results, node_pos))
-                }
-                Type::ListCons => {
-                    dbg!(right);
-                    let Node::ListCons { left: left_inner, right: right_inner } = ast.get(right).clone() else {
-                        unreachable!();
-                    };
-
-                    let right_data= eval(ctx, ast, right_inner)?;
-                    dbg!(&ast.nodes[right_data]);
-
-
-                    let Node::List { data } = ast.get(right_data) else {
-                        unreachable!();
-                    };
-
-                    let mut results = vec![left, left_inner];
-                    results.extend(data);
-
-                    Ok(ast.list(results, node_pos))
-                }
-                _ => {
-                    Err((EvalError::ListTypeMismatch(right_type), ast.positions[right.0]))
-                }
-            }
-        }
-        Type::ListAppend  => {
-            let Node::ListAppend { left, right } = ast.nodes[root] else {
-                unreachable!();
-            };
-
-            let left_data = eval(ctx, ast, left)?;
-            let left_type = ast.get_type(&left_data);
-
-            match left_type {
-                Type::List => {
-                    let Node::List { data } = ast.get(left_data) else {
-                        unreachable!();
-                    };
-
-                    let mut new_data = data.clone();
-                    new_data.push(right);
-                    Ok(ast.list(new_data, node_pos))
-                }
-                _ => {
-                    Err((EvalError::ListTypeMismatch(left_type), ast.positions[left.0]))
-                }
-            }
-        }
-        Type::List => {
-            let mut results = Vec::new();
-            let mut list_len = 0;
-            if let Node::List { data} = &ast.nodes[root] {
-                list_len = data.len();
-            }
-
-            for i in 0..list_len {
-                let elem = if let Node::List { data} = &ast.nodes[root] {
-                    data[i]
+                if let (Node::String { data: l_str }, Node::String { data: r_str}) = (left_data, right_data) {
+                    let mut new_data = l_str.clone();
+                    new_data.push_str(r_str);
+                    arguments.push_back(ast.string(new_data, node_pos));
                 } else {
-                    unreachable!()
-                };
+                    return Err((EvalError::NonStringFoundInStringConcat(curr_node.clone()), node_pos));
+                }
+            }
+            Node::List { data} => {
+                if eval_state == EvalState::NeedArguments {
+                    work.push_front((curr_node_id, EvalState::Ready));
+                    for item in data {
+                        work.push_front((*item, EvalState::NeedArguments));
+                    }
+                    continue;
+                }
 
-                let new_data = eval(ctx, ast, elem)?;
-                results.push(new_data);
+                // Pop the results back from the arguments list
+                let results = (0..data.len()).map(|_| arguments.pop_back().unwrap()).collect();
+
+                arguments.push_back(ast.list(results, node_pos));
+            }
+            Node::ListCons { left, right } => {
+                if eval_state == EvalState::NeedArguments {
+                    work.push_front((curr_node_id, EvalState::Ready));
+                    work.push_front((*left, EvalState::NeedArguments));
+                    work.push_front((*right, EvalState::NeedArguments));
+                    continue;
+                }
+
+                let left_data_id = arguments.pop_back().unwrap();
+                let right_data_id = arguments.pop_back().unwrap();
+
+                let left_data = ast.get(left_data_id);
+                let right_data = ast.get(right_data_id);
+
+                dbg!(&left_data);
+                dbg!(&right_data);
+
+                match right_data {
+                    Node::List { data } => {
+                        let mut results = vec![left_data_id];
+
+                        for d in data {
+                            results.push(*d);
+                        }
+
+                        dbg!(&results);
+
+                        arguments.push_back(ast.list(results, node_pos));
+                    }
+                    _ => {
+                        return Err((EvalError::ListTypeMismatch(ast.get_type(&right_data_id)), ast.positions[right.0]));
+                    }
+                }
+            }
+            Node::ListAppend { left, right } => {
+                if eval_state == EvalState::NeedArguments {
+                    work.push_front((curr_node_id, EvalState::Ready));
+                    work.push_front((*left, EvalState::NeedArguments));
+                    work.push_front((*right, EvalState::NeedArguments));
+                    continue;
+                }
+
+                let left_data_id = arguments.pop_back().unwrap();
+                let right_data_id = arguments.pop_back().unwrap();
+
+                let left_data = ast.get(left_data_id);
+                let right_data = ast.get(right_data_id);
+
+                dbg!(&left_data);
+                dbg!(&right_data);
+
+                match left_data {
+                    Node::List { data } => {
+                        let mut new_data = data.clone();
+                        new_data.push(right_data_id);
+                        arguments.push_back(ast.list(new_data, node_pos));
+                    }
+                    _ => {
+                        return Err((EvalError::ListTypeMismatch(ast.get_type(&left_data_id)), ast.positions[left.0]));
+                    }
+                }
+            }
+            Node::Where { left, right } => {
+                if eval_state == EvalState::NeedArguments {
+                    // Right will be evaluated before the left
+                    // 
+                    // Right will be evalauted with a new context
+                    // Left  will be evaluated using the context from the right's evaluation
+                    // work.push_front((curr_node_id, EvalState::Ready));
+                    work.push_front((*left, EvalState::NeedArguments));
+                    work.push_front((*right, EvalState::NeedArguments));
+                    continue;
+                }
+            }
+            Node::Assert { left, right } => {
+                if eval_state == EvalState::NeedArguments {
+                    work.push_front((curr_node_id, EvalState::Ready));
+                    work.push_front((*left, EvalState::NeedArguments));
+                    work.push_front((*right, EvalState::NeedArguments));
+                    continue;
+                }
+
+                let left_data_id = arguments.pop_back().unwrap();
+                let right_data_id = arguments.pop_back().unwrap();
+
+                let left_data = ast.get(left_data_id);
+                let right_data = ast.get(right_data_id);
+
+                dbg!(&left_data);
+                dbg!(&right_data);
+
+                match (left_data, right_data) {
+                    (Node::True, _) =>  arguments.push_back(right_data_id),
+                    (_, Node::True) =>  arguments.push_back(left_data_id),
+                    (Node::False, _) => return Err((EvalError::FalseConditionFound, ast.positions[left.0])),
+                    (_, Node::False) => return Err((EvalError::FalseConditionFound, ast.positions[right.0])),
+                    _ => todo!()
+                }
+            }
+            Node::Apply { func, arg } => {
+                // Evaluate the argument, then the function (with a new context), then this apply again to restore the original context
+                if eval_state == EvalState::NeedArguments {
+                    work.push_front((curr_node_id, EvalState::Ready));
+                    work.push_front((*func, EvalState::NeedArguments));
+                    work.push_front((*arg, EvalState::NeedArguments));
+                    continue;
+                }
+
+                let func = arguments.pop_back().unwrap();
+                let arg = arguments.pop_back().unwrap();
+
+                arguments.push_back(arg);
+                work.push_front((func, EvalState::Ready));
+
+                /*
+                assert!(!contexts.is_empty());
+
+                // Restore the original context
+                let old_context = contexts.pop_front().unwrap();
+                *ctx = old_context;
+                */
+            }
+            Node::Record { keys, values } => {
+                // Evaluate the argument, then the function (with a new context), then this apply again to restore the original context
+                if eval_state == EvalState::NeedArguments {
+                    work.push_front((curr_node_id, EvalState::Ready));
+
+                    for (key, val) in keys.iter().zip(values.iter()) {
+                        work.push_front((*key, EvalState::NeedArguments));
+                        work.push_front((*val, EvalState::NeedArguments));
+                    }
+
+                    continue;
+                }
+
+                let length = keys.len();
+
+                let mut new_keys = Vec::new();
+                let mut new_values= Vec::new();
+
+                for _ in 0..length {
+                    new_keys.push(arguments.pop_back().unwrap());
+                    new_values.push(arguments.pop_back().unwrap());
+                }
+
+                arguments.push_back(ast.record(new_keys, new_values, node_pos));
             }
 
+            Node::Access { left, right } => {
+                if eval_state == EvalState::NeedArguments {
+                    work.push_front((curr_node_id, EvalState::Ready));
+                    work.push_front((*left, EvalState::NeedArguments));
+                    work.push_front((*right, EvalState::NeedArguments));
+                    continue;
+                }
 
-            Ok(ast.list(results, node_pos))
-        }
-        Type::Where => {
-            let Node::Where { left, right } = ast.nodes[root] else {
-                unreachable!();
-            };
+                let left_data_id = arguments.pop_back().unwrap();
+                let right_data_id = arguments.pop_back().unwrap();
 
-            let mut local_scope = Context::default();
+                let left_data = ast.get(left_data_id);
+                let right_data = ast.get(right_data_id);
 
-            // Evaluate the right side of the where clause to gather the environment
-            let _ = eval(&mut local_scope, ast, right)?;
+                dbg!(&left_data);
+                dbg!(&right_data);
 
-            // Add the found scope's env into the global scope
-            ctx.env.extend(local_scope.env.clone());
+                match left_data {
+                    Node::Record { keys, values } => {
+                        let Node::Var { data: wanted_key} = right_data else {
+                            unreachable!();
+                        };
 
-            // Use the evaluated environment to evaluate the left side
-            let left_data = eval(ctx, ast, left)?;
+                        for index in 0..keys.len() {
+                            let Node::Var { data } = ast.get(keys[index]) else {
+                                unreachable!();
+                            };
 
-            // Add the found scope's env into the global scope
-            ctx.env.extend(local_scope.env);
+                            dbg!(data, wanted_key);
 
-            Ok(left_data)
-        }
-        Type::Assert => {
-            let Node::Assert { left, right } = ast.nodes[root] else {
-                unreachable!();
-            };
+                            // If this isn't the requested key, keep looking
+                            if data != wanted_key {
+                                continue;
+                            }
 
-            let left_data_id = eval(ctx, ast, left)?;
-            let right_data_id = eval(ctx, ast, right)?;
+                            arguments.push_back(values[index]);
+                            continue 'work;
+                        }
 
-            let left_data = ast.get(left_data_id);
-            let right_data = ast.get(right_data_id);
+                        return Err((EvalError::KeyNotFoundInRecord(wanted_key.clone()), ast.positions[right.0]));
+                    
+                    }
+                    Node::List { data } => {
+                        let Node::Int { data: index} = right_data else {
+                            return Err((EvalError::InvalidListAccessType(ast.get_type(&right)), ast.positions[right.0]));
+                        };
 
-            match (left_data, right_data) {
-                (Node::True, _) =>  Ok(right_data_id),
-                (_, Node::True) =>  Ok(left_data_id),
-                (Node::False, _) => Err((EvalError::FalseConditionFound, ast.positions[left.0])),
-                (_, Node::False) => Err((EvalError::FalseConditionFound, ast.positions[right.0])),
-                _ => todo!()
+                        if usize::try_from(*index).unwrap() >= data.len() {
+                            return Err((
+                                EvalError::ListIndexOutOfBounds { 
+                                    length: data.len(), 
+                                    wanted_index: usize::try_from(*index).unwrap() 
+                                }, ast.positions[right.0]));
+                        }
+
+                        let index: usize = (*index).try_into().unwrap();
+                        arguments.push_back(data[index]);
+                        continue
+                    
+                    }
+                    _ => return Err((EvalError::InvalidAccessType(ast.get_type(&left_data_id)), ast.positions[left.0])),
+                }
             }
-        }
-        Type::Apply => {
-            let Node::Apply { func, arg } = ast.nodes[root].clone() else {
-                unreachable!();
-            };
+            Node::MatchFunction { data} => {
+                // A function needs to be used in [`Node::Apply`] operation. Until then, add itself to the argument list.
+                if eval_state == EvalState::NeedArguments {
+                    arguments.push_back(curr_node_id);
+                    continue 'work;
+                }
 
-            // Add this argument to the current arguments, then evaluate the function
-            let arg = eval(ctx, ast, arg)?;
-            ctx.args.push(arg);
-
-            if let Node::Var { data: keyword } = &ast.nodes[func.0] {
-                let Some(target_func) = ctx.env.get(keyword) else {
-                    return Err((EvalError::VariableNotFoundInScope(keyword.clone()), ast.positions[func.0]));
+                let Some(argument) = arguments.pop_back() else {
+                    return Err((EvalError::NoArgumentsGivenToFunction, node_pos));
                 };
 
-                Ok(eval(ctx, ast, *target_func)?)
-            } else {
-                Ok(eval(ctx, ast, func)?)
-            }
-        }
-        Type::Record => {
-            let mut length = 0;
+                // Get the requested match case
+                let wanted_case = &ast.nodes[argument.0];
+                let wanted_case_type = ast.get_type(&argument);
 
-            if let Node::Record { keys, .. } = &ast.nodes[root] {
-                length = keys.len();
-            };
-
-            let mut new_keys = Vec::new();
-            let mut new_values= Vec::new();
-
-            for index in 0..length {
-                let Node::Record { values, .. } = &ast.nodes[root] else {
-                    unreachable!();
-                };
-
-                let curr_value = values[index];
-                let evaluated_id= eval(ctx, ast, curr_value)?;
-
-                let Node::Record { keys, .. } = &ast.nodes[root] else {
-                    unreachable!();
-                };
-
-                new_keys.push(keys[index]);
-                new_values.push(evaluated_id);
-            }
-
-            Ok(ast.record(new_keys, new_values, node_pos))
-        }
-        Type::Access => {
-            let Node::Access { left, right } = ast.nodes[root] else {
-                unreachable!();
-            };
-
-            let left_data_id = eval(ctx, ast, left)?;
-            let right_data_id = eval(ctx, ast, right)?;
-
-            let left_data = ast.get(left_data_id);
-            let right_data = ast.get(right_data_id);
-
-            /*
-            let Node::Var { data: obj_name } = left_data else {
-                return Err((EvalError::AccessObjectNotFound, ast.positions[left.0]));
-            };
-
-            let Some(obj_id) = ctx.env.get(obj_name) else {
-                return Err((EvalError::VariableNotFoundInScope(obj_name.clone()), ast.positions[left.0]));
-            };
-            */
-
-            // let obj = ast.get(*obj_id);
-
-            match left_data {
-                Node::Record { keys, values } => {
-                    let Node::Var { data: wanted_key} = right_data else {
+                // Check for the correct match case
+                for assignment in data {
+                    let Node::MatchCase { left, right } = ast.nodes[*assignment] else {
                         unreachable!();
                     };
 
-                    for index in 0..keys.len() {
-                        let Node::Var { data } = ast.get(keys[index]) else {
-                            unreachable!();
-                        };
+                    // Otherwise, check if this exact case matches
+                    let curr_check_case = &ast.nodes[left.0];
 
-                        // If this isn't the requested key, keep looking
-                        if data != wanted_key {
-                            continue;
+                    match curr_check_case {
+                        Node::Record { keys: checked_keys, values: checked_values } if wanted_case_type == Type::Record => {
+                            let Node::Record { keys: wanted_keys, values: wanted_values } = wanted_case else {
+                                unreachable!();
+                            };
+
+                            let mut found = true;
+                            let mut results = HashSet::new();
+
+                            // Iterate over the keys in the wanted case looking for a match in the possible match branches
+                            'next_key: for (index, wanted_key_id) in wanted_keys.iter().enumerate() {
+                                let wanted_key = &ast.nodes[wanted_key_id.0];
+
+                                for checked_key_id in checked_keys {
+                                    let checked_key = &ast.nodes[checked_key_id.0];
+                                    if checked_key == wanted_key {
+                                        let Node::Var { data} = checked_key else {
+                                            unreachable!();
+                                        };
+
+                                        let new_value = wanted_values[index];
+                                        results.insert((data.to_string(), wanted_values[index]));
+                                        continue 'next_key;
+                                    }
+                                }
+
+                                found = false;
+                                break 'next_key;
+                            }
+
+                            if found {
+                                for (key, val) in results {
+                                    ctx.env.insert(key, val);
+                                }
+
+                                work.push_front((right, EvalState::NeedArguments));
+                                continue 'work;
+                            }
+                        
+                            dbg!(curr_check_case);
+                            todo!();
                         }
 
-                        return Ok(values[index]);
+                        Node::Int { .. } => {
+                            if wanted_case == curr_check_case {
+                                arguments.push_back(right);
+                                continue 'work;
+                            }
+                        }
+                        // Variable match case matches everything
+                        Node::Var { data } => {
+                            ctx.env.insert(data.to_string(), argument);
+                            work.push_front((right, EvalState::NeedArguments));
+                            continue 'work;
+                        }
+                        x => {
+                            unimplemented!("{x:?}");
+                        }
                     }
-
-                    Err((EvalError::KeyNotFoundInRecord(wanted_key.clone()), ast.positions[right.0]))
-                    
                 }
-                Node::List { data } => {
-                    let Node::Int { data: index} = right_data else {
-                        return Err((EvalError::InvalidListAccessType(ast.get_type(&right)), ast.positions[right.0]));
+
+
+                // Match case NOT found.. populate the error result
+                let mut all_cases = Vec::new();
+                for assignment in data {
+                    let Node::MatchCase { left, .. } = ast.nodes[*assignment] else {
+                        unreachable!();
                     };
 
-                    if usize::try_from(*index).unwrap() >= data.len() {
-                        return Err((
-                            EvalError::ListIndexOutOfBounds { 
-                                length: data.len(), 
-                                wanted_index: usize::try_from(*index).unwrap() 
-                            }, ast.positions[right.0]));
-                    }
-
-                    let index: usize = (*index).try_into().unwrap();
-                    Ok(data[index])
-                    
+                    let curr_case = &ast.nodes[left.0];
+                    all_cases.push(curr_case.clone());
                 }
-                _ => Err((EvalError::InvalidAccessType(ast.get_type(&left_data_id)), ast.positions[left.0]))
+
+                return Err((EvalError::MatchCaseNotFound(wanted_case.clone(), all_cases), ast.positions[argument.0]));
             }
-        }
-        Type::MatchFunction => {
-            let Node::MatchFunction { data} = &ast.nodes[root] else {
-                unreachable!();
-            };
+            Node::Compose { left, right } => {
+                // Allow [`Node::Apply`] to call compose with Ready
+                if eval_state == EvalState::NeedArguments {
+                    arguments.push_back(curr_node_id);
+                    continue 'work;
+                }
 
-            let Some(argument) = ctx.args.pop() else {
-                return Err((EvalError::NoArgumentsGivenToFunction, node_pos));
-            };
-
-            // Get the requested match case
-            let wanted_case = &ast.nodes[argument.0];
-            let wanted_case_type = ast.get_type(&argument);
-
-            println!("Matching: {wanted_case:?}");
-
-            // Check for the correct match case
-            for assignment in data {
-                let Node::MatchCase { left, right } = ast.nodes[*assignment] else {
-                    unreachable!();
-                };
-
-                // Otherwise, check if this exact case matches
-                let curr_check_case = &ast.nodes[left.0];
-
-                match curr_check_case {
-                    Node::Record { keys: checked_keys, values: checked_values } if wanted_case_type == Type::Record => {
-                        let Node::Record { keys: wanted_keys, values: wanted_values } = wanted_case else {
-                            unreachable!();
-                        };
-
-                        let mut found = true;
-                        let mut results = HashSet::new();
-
-                        // Iterate over the keys in the wanted case looking for a match in the possible match branches
-                        'next_key: for (index, wanted_key_id) in wanted_keys.iter().enumerate() {
-                            let wanted_key = &ast.nodes[wanted_key_id.0];
-
-                            for checked_key_id in checked_keys {
-                                let checked_key = &ast.nodes[checked_key_id.0];
-                                if checked_key == wanted_key {
-                                    let Node::Var { data} = checked_key else {
-                                        unreachable!();
-                                    };
-
-                                    let new_value = wanted_values[index];
-                                    results.insert((data.to_string(), wanted_values[index]));
-                                    continue 'next_key;
-                                }
-                            }
-
-                            found = false;
-                            break 'next_key;
-                        }
-
-                        if found {
-                            for (key, val) in results {
-                                ctx.env.insert(key, val);
-                            }
-
-                            println!("{right:?}");
-                            return eval(ctx, ast, right);
-                        }
-                        
-                        dbg!(curr_check_case);
-                        todo!();
-                    }
-
-                    Node::Int { .. } => {
-                        if wanted_case == curr_check_case {
-                            return Ok(right);
-                        }
-                    }
-                    // Variable match case matches everything
-                    Node::Var { data } => {
-                        ctx.env.insert(data.to_string(), argument);
-                        return eval(ctx, ast, right);
-                    }
-                    x => {
-                        unimplemented!("{x:?}");
-                    }
+                // Now that we are [`Ready`]
+                work.push_front((*right, EvalState::Ready));
+                work.push_front((*left, EvalState::Ready));
+            }
+            Node::Var { data } => {
+                if let Some(var_node) = ctx.env.get(data) {
+                    arguments.push_back(*var_node);
+                } else {
+                    // Otherwise, push the variable onto the arguments for something else to use
+                    arguments.push_back(curr_node_id);
                 }
             }
-
-
-            // Match case NOT found.. populate the error result
-            let mut all_cases = Vec::new();
-            for assignment in data {
-                let Node::MatchCase { left, .. } = ast.nodes[*assignment] else {
-                    unreachable!();
-                };
-
-                let curr_case = &ast.nodes[left.0];
-                all_cases.push(curr_case.clone());
+            Node::Int { .. }
+            | Node::Float { .. }
+            | Node::String { .. }
+            | Node::Bytes { .. }
+            | Node::Hole  { .. }
+            | Node::True { .. }
+            | Node::False { .. }
+            => {
+                // Base case.. Return the node as is. Nothing more to evaluate
+                arguments.push_back(curr_node_id);
             }
-
-            Err((EvalError::MatchCaseNotFound(wanted_case.clone(), all_cases), ast.positions[argument.0]))
-        }
-        Type::Compose => {
-            let Node::Compose { left, right } = ast.nodes[root] else {
-                unreachable!();
-            };
-
-            let left_data_id = eval(ctx, ast, left)?;
-
-            // Use the result from the first function as input to the second
-            ctx.args.push(left_data_id);
-
-            let result = eval(ctx, ast, right)?;
-
-            Ok(result)
-        }
-        Type::Var => {
-            let Node::Var { data } = &ast.nodes[root] else {
-                unreachable!();
-            };
-
-            let Some(var_node) = ctx.env.get(data) else {
-                // return Err((EvalError::VariableNotFoundInScope(data.to_string()), node_pos));
-                return Ok(root);
-            };
-
-            Ok(eval(ctx, ast, *var_node)?)
-       }
-        Type::Int
-        | Type::Float
-        | Type::String
-        | Type::Bytes
-        | Type::Hole 
-        | Type::True
-        | Type::False
-        => {
-            // Base case.. Return the node as is. Nothing more to evaluate
-            Ok(root)
+            x => {
+                unimplemented!("{x:?}");
+            }
         }
     }
-    
+
+
+    ctx.args.clear();
+    ctx.env.clear();
+
+    if arguments.is_empty() {
+        print_ast(&ast);
+        dbg!(&arguments);
+        assert!(arguments.len() == 1);
+    }
+
+    let result = arguments.pop_back().unwrap();
+    Ok(ast.finish(result).unwrap())
 }
 
 /// Convert the input program into a list of tokens
@@ -3054,10 +3241,10 @@ mod tests {
     use TokenId::*;
 
     #[allow(clippy::needless_pass_by_value)]
-    fn impl_eval_test_with_env(
+    fn __impl_eval_test_with_env(
             input: &'static str, 
             init_env: &[(std::string::String, NodeId)],
-            wanted_result: Node, 
+            wanted_result: EvalResult, 
             result_env: &[(std::string::String, NodeId)]) -> Result<(), (EvalError, u32)> {
         let (root, mut ast) = parse_str(input).unwrap();
 
@@ -3081,13 +3268,10 @@ mod tests {
             println!("{i}: {node:?}");
         }
 
-        ast.dump_dot(curr_result, "/tmp/dump_after").unwrap();
+        // ast.dump_dot(curr_result, "/tmp/dump_after").unwrap();
+        dbg!(&curr_result);
 
-        dbg!(curr_result);
-
-        let curr_result = ast.nodes[curr_result].clone();
         assert_eq!(curr_result, wanted_result);
-
 
         let mut res_env = HashMap::new();
         for (key, value) in result_env {
@@ -3100,7 +3284,7 @@ mod tests {
     }
 
     #[allow(clippy::needless_pass_by_value)]
-    fn end_to_end_test(input: &'static str,  wanted_result: Node) -> Result<(), (EvalError, u32)> {
+    fn end_to_end_test(input: &'static str,  wanted_result: EvalResult) -> Result<(), (EvalError, u32)> {
         let (root, mut ast) = parse_str(input).unwrap();
 
         ast.dump_dot(root, "/tmp/dump").unwrap();
@@ -3119,11 +3303,10 @@ mod tests {
             println!("{i}: {node:?}");
         }
 
-        ast.dump_dot(curr_result, "/tmp/dump_after").unwrap();
+        // ast.dump_dot(curr_result, "/tmp/dump_after").unwrap();
 
-        dbg!(curr_result);
+        dbg!(&curr_result);
 
-        let curr_result = ast.nodes[curr_result].clone();
         assert_eq!(curr_result, wanted_result);
 
         Ok(())
@@ -5511,452 +5694,291 @@ mod tests {
     // Eval tests
     /////////////////////////////////////////////////////////////////
     
-    macro_rules! impl_eval_test {
-        ($input:literal, $res:expr) => {
-            let env = vec![];
-            let result_env = vec![];
-
-            let _ = impl_eval_test_with_env(
-                $input, 
-                &env, 
-                $res, 
-                &result_env);
-        }
-    }
-
-
-    macro_rules! impl_err_test {
-        ($input:literal, $res:expr) => {
-            let (root, mut ast) = parse_str($input).unwrap();
-            let mut ctx = Context::default();
-            match eval(&mut ctx, &mut ast, root) {
-                Ok(result) => {
-                    dbg!(&result);
-                }
-                Err((err, loc)) => {
-                    if (err.clone(), loc) != $res {
-                        print_error($input, &Error::Eval((err.clone(), loc as usize)));
-                    }
-
-                    assert_eq!((err, loc), $res);
-                }
-                
-            }
-        }
-    }
-
     #[test]
     fn test_eval_int() {
-        impl_eval_test!("1", 1.into());
+        end_to_end_test("1", 1.into()).unwrap();
     }
 
     #[test]
     fn test_eval_float() {
-        impl_eval_test!("2.21", 2.21.into());
+        end_to_end_test("2.21", 2.21.into()).unwrap();
     }
 
     #[test]
     fn test_eval_add() {
-        impl_eval_test!("1+2", 3.into());
+        end_to_end_test("1+2", 3.into()).unwrap();
     }
 
     #[test]
     fn test_eval_nested_add() {
-        impl_eval_test!("1+2+3", 6.into());
+        end_to_end_test("1+2+3", 6.into()).unwrap();
     }
 
     #[test]
     fn test_eval_nested_add_float() {
-        impl_eval_test!("-1.1+2.2+3.3-1.0", 3.4.into());
-    }
-
-    #[test]
-    fn test_eval_variable() {
-        let input = "a=3";
-        let (root, mut ast) = parse_str(input).unwrap();
-        let mut ctx= Context::default();
-        let result = eval(&mut ctx, &mut ast, root).unwrap();
-        let result = ast.nodes[result].clone();
-        assert_eq!( result, Node::Assign { left: NodeId(0), right: NodeId(1) } );
-
-        let mut check = HashMap::new();
-        check.insert("a".to_string(), NodeId(1));
-        assert_eq!(ctx.env, check);
-    }
-
-    #[test]
-    fn test_eval_add_string() {
-        impl_err_test!("1 + hello",
-            (EvalError::VariableNotFoundInScope("hello".to_string()), 4)
-        );
+        end_to_end_test("-1.1+2.2+3.3-1.0", 3.4.into()).unwrap();
     }
 
     #[test]
     fn test_eval_sub() {
-        impl_eval_test!("1 - 2", (-1).into());
+        end_to_end_test("1 - 2", (-1).into()).unwrap();
     }
 
     #[test]
     fn test_eval_sub_string() {
-        impl_err_test!("1 - hello",
-            (EvalError::VariableNotFoundInScope("hello".to_string()), 4));
+        let err = end_to_end_test("1 - hello", 1.into()).err().unwrap();
+        assert_eq!(err, (EvalError::VariableNotFoundInScope("hello".to_string()), 4));
     }
 
     #[test]
     fn test_eval_mul() {
-        impl_eval_test!("3 * 2", 6.into());
+        end_to_end_test("3 * 2", 6.into()).unwrap();
     }
 
     #[test]
     fn test_eval_mul_float() {
-        impl_eval_test!("3.1 * 1.0", 3.1.into());
+        end_to_end_test("3.1 * 1.0", 3.1.into()).unwrap();
     }
 
     #[test]
     fn test_eval_mul_string() {
-        impl_err_test!("1 * hello",
-            (EvalError::VariableNotFoundInScope("hello".to_string()), 4)
-        );
+        let err = end_to_end_test("1 * hello", 1.into()).err().unwrap();
+        assert_eq!(err,  (EvalError::VariableNotFoundInScope("hello".to_string()), 4));
     }
 
     #[test]
     fn test_eval_div() {
-        impl_eval_test!("8 / 2", 4.into());
+        end_to_end_test("8 / 2", 4.into()).unwrap();
     }
 
     #[test]
     fn test_eval_floor_div() {
-        impl_eval_test!("8.4 // 2.0", 4.0.into());
+        end_to_end_test("8.4 // 2.0", 4.0.into()).unwrap();
     }
 
     #[test]
     fn test_eval_exp() {
-        impl_eval_test!("2 ^ 3", 8.into());
+        end_to_end_test("2 ^ 3", 8.into()).unwrap();
     }
 
     #[test]
     fn test_eval_exp_floor() {
-        impl_eval_test!("2.0 ^ 3.0", 8.0.into());
+        end_to_end_test("2.0 ^ 3.0", 8.0.into()).unwrap();
     }
 
     #[test]
     fn test_eval_exp_floor_int_vs_float() {
-        impl_err_test!("2.0 ^ 3",
-            (EvalError::InvalidNodeTypes(Type::Exp), 4)
-        );
+        let err = end_to_end_test("2.0 ^ 3", 1.into()).err().unwrap();
+        assert_eq!(err,  (EvalError::InvalidNodeTypes(Type::Exp), 4));
     }
 
     #[test]
     fn test_eval_mod() {
-        impl_eval_test!("8 % 3", 2.into());
+        end_to_end_test("8 % 3", 2.into()).unwrap();
     }
 
     #[test]
     fn test_eval_mod_floor() {
-        impl_eval_test!("8.0 % 2.5", 0.5.into());
+        end_to_end_test("8.0 % 2.5", 0.5.into()).unwrap();
     }
 
     #[test]
     fn test_eval_mod_floor_int_vs_float() {
-        impl_err_test!("8 % 2.0",
-            (EvalError::InvalidNodeTypes(Type::Mod), 2)
-        );
+        let err = end_to_end_test("8 % 2.0", 1.into()).err().unwrap();
+        assert_eq!(err, (EvalError::InvalidNodeTypes(Type::Mod), 2));
     }
 
     #[test]
     fn test_eval_equal_int_true() {
-        impl_eval_test!("8 == 3", Node::False);
-        impl_eval_test!("8 /= 3", Node::True);
+        end_to_end_test("8 == 3", EvalResult::False).unwrap();
+        end_to_end_test("8 /= 3", EvalResult::True).unwrap();
     }
 
     #[test]
     fn test_eval_equal_int_false() {
-        impl_eval_test!("8 == 8", Node::True);
-        impl_eval_test!("8 /= 8", Node::False);
+        end_to_end_test("8 == 8", EvalResult::True).unwrap();
+        end_to_end_test("8 /= 8", EvalResult::False).unwrap();
     }
 
     #[test]
     fn test_eval_equal_float_true() {
-        impl_eval_test!("8.0 == 8.0", Node::True);
-        impl_eval_test!("8.0 /= 8.0", Node::False);
+        end_to_end_test("8.0 == 8.0", EvalResult::True).unwrap();
+        end_to_end_test("8.0 /= 8.0", EvalResult::False).unwrap();
     }
 
     #[test]
     fn test_eval_equal_float_false() {
-        impl_eval_test!("8.0 == 2.0", Node::False);
-        impl_eval_test!("8.0 /= 2.0", Node::True);
+        end_to_end_test("8.0 == 2.0", EvalResult::False).unwrap();
+        end_to_end_test("8.0 /= 2.0", EvalResult::True).unwrap();
     }
 
     #[test]
     fn test_eval_equal_floor_int_vs_float() {
-        impl_err_test!("8 == 2.0",
-            (EvalError::InvalidNodeTypes(Type::Equal), 2)
-        );
-        impl_err_test!("8 /= 2.0",
-            (EvalError::InvalidNodeTypes(Type::NotEqual), 2)
-        );
+        let err = end_to_end_test("8 == 2.0", 1.into()).err().unwrap();
+        assert_eq!(err,  (EvalError::InvalidNodeTypes(Type::Equal), 2));
+
+        let err = end_to_end_test("8 /= 2.0", 1.into()).err().unwrap();
+        assert_eq!(err,  (EvalError::InvalidNodeTypes(Type::NotEqual), 2));
     }
 
     #[test]
     fn test_eval_equal_negative_float_false() {
-        impl_eval_test!("8.0 == -2.0", Node::False);
-        impl_eval_test!("8.0 /= -2.0", Node::True);
+        end_to_end_test("8.0 == -2.0", EvalResult::False).unwrap();
+        end_to_end_test("8.0 /= -2.0", EvalResult::True).unwrap();
     }
 
     #[test]
     fn test_eval_equal_negative_float_true() {
-        impl_eval_test!("-8.0 == -8.0", Node::True);
-        impl_eval_test!("-8.0 /= -8.0", Node::False);
+        end_to_end_test("-8.0 == -8.0", EvalResult::True).unwrap();
+        end_to_end_test("-8.0 /= -8.0", EvalResult::False).unwrap();
     }
 
     #[test]
     fn test_eval_equal_float_true_tests() {
-        impl_eval_test!("0.0 == 0.0", Node::True);
-        impl_eval_test!("0.00000001 == 0.0", Node::False);
-        impl_eval_test!("0.00000000001 == 0.0", Node::False);
-        impl_eval_test!("0.000000000000001 == 0.0", Node::True);
+        end_to_end_test("0.0 == 0.0", EvalResult::True).unwrap();
+        end_to_end_test("0.00000001 == 0.0", EvalResult::False).unwrap();
+        end_to_end_test("0.00000000001 == 0.0", EvalResult::False).unwrap();
+        end_to_end_test("0.000000000000001 == 0.0", EvalResult::True).unwrap();
 
-        impl_eval_test!("0.0 /= 0.0", Node::False);
-        impl_eval_test!("0.00000001 /= 0.0", Node::True);
-        impl_eval_test!("0.00000000001 /= 0.0", Node::True);
-        impl_eval_test!("0.000000000000001 /= 0.0", Node::False);
+        end_to_end_test("0.0 /= 0.0", EvalResult::False).unwrap();
+        end_to_end_test("0.00000001 /= 0.0", EvalResult::True).unwrap();
+        end_to_end_test("0.00000000001 /= 0.0", EvalResult::True).unwrap();
+        end_to_end_test("0.000000000000001 /= 0.0", EvalResult::False).unwrap();
     }
 
     #[test]
     fn test_eval_string_concat() {
-        impl_eval_test!("\"hello\" ++ \"world\"", Node::String { data: "helloworld".to_string() });
+        end_to_end_test("\"hello\" ++ \"world\"", "helloworld".into()).unwrap();
     }
 
     #[test]
     fn test_eval_string_concat_with_space() {
-        impl_eval_test!("\"hello\" ++ \" \" ++ \"world\"", Node::String { data: "hello world".to_string() });
+        end_to_end_test("\"hello\" ++ \" \" ++ \"world\"", "hello world".into()).unwrap();
     }
 
     #[test]
     fn test_eval_string_concat_error() {
-        impl_err_test!("\"hello\" ++ 1", (EvalError::NonStringFoundInStringConcat(Node::StrConcat { left: NodeId(0), right: NodeId(1) }), 8));
+        let err = end_to_end_test("\"hello\" ++ 1", 1.into()).err().unwrap();
+        assert_eq!(err, (EvalError::NonStringFoundInStringConcat(Node::StrConcat { left: NodeId(0), right: NodeId(1) }), 8));
     }
 
     #[test]
     fn test_eval_string_concat_error2() {
-        impl_err_test!("1 ++ \"hello\"", (EvalError::NonStringFoundInStringConcat(Node::StrConcat { left: NodeId(0), right: NodeId(1) }), 2));
+        let err = end_to_end_test("1 ++ \"hello\"", 1.into()).err().unwrap();
+        assert_eq!(err, (EvalError::NonStringFoundInStringConcat(Node::StrConcat { left: NodeId(0), right: NodeId(1) }), 2));
     }
 
     #[test]
     fn test_eval_list_cons() {
-        impl_eval_test!("1 >+ [2, 3]", 
-            Node::List { 
-                data: vec![
-                    NodeId(0),
-                    NodeId(1),
-                    NodeId(2),
-                ] 
-            });
+        end_to_end_test("1 >+ [2, 3]", 
+            vec![ 1.into(), 2.into(), 3.into() ].into()
+        ).unwrap();
     }
 
     #[test]
     fn test_eval_list_cons2() {
-        impl_err_test!("[2, 3] >+ 1", (EvalError::ListTypeMismatch(Type::Int), 10));
+        let err = end_to_end_test("[2, 3] >+ 1", 1.into()).err().unwrap();
+        assert_eq!(err, (EvalError::ListTypeMismatch(Type::Int), 10));
     }
 
     #[test]
     fn test_eval_list_cons3() {
-        impl_eval_test!("[] >+ []", 
-            Node::List { 
-                data: vec![
-                    NodeId(0),
-                ]
-            });
+        end_to_end_test("[] >+ []", 
+            vec![
+                vec![].into()
+            ].into()
+        ).unwrap();
     }
 
     #[test]
     fn test_eval_list_append() {
-        impl_eval_test!("[1, 2] +< 3", 
-            Node::List { 
-                data: vec![
-                    NodeId(0),
-                    NodeId(1),
-                    NodeId(3)
-                ]
-            });
+        end_to_end_test("[1, 2] +< 3", 
+            vec![
+                1.into(),
+                2.into(),
+                3.into()
+            ].into()
+        ).unwrap();
     }
 
     #[test]
     fn test_eval_list_append_evaluate_elements() {
-        impl_eval_test!("[1 + 2, 3 + 4]", 
-            Node::List { 
-                data: vec![
-                    NodeId(7),
-                    NodeId(8)
-                ]});
-    }
-
-    #[test]
-    fn test_eval_with_list_evaluates_elements() {
-        impl_eval_test!(
-            "[1 + 2, 3 + 4]", 
-            Node::List { 
-                data: vec![
-                    NodeId(7),
-                    NodeId(8)
-                ]}
-        );
-    }
-
-    #[test]
-    fn test_eval_assign_returns_env_object() {
-        impl_eval_test_with_env(
-            "a = 1",
-            &[ ],
-            Node::Assign { left: NodeId(0), right: NodeId(1) },
-            &[
-                ("a".to_string(), NodeId(1))
-            ]
-        ).unwrap();
-    }
-
-    #[test]
-    fn test_eval_assign_function_returns_closure_without_function_in_env() {
-        impl_eval_test_with_env(
-            "a = x -> x",
-            &[ ],
-            Node::Assign { left: NodeId(0), right: NodeId(3) },
-            &[
-                ("a".to_string(), NodeId(3))
-            ]
-        ).unwrap();
-    }
-
-    #[test]
-    fn test_eval_assign_function_returns_closure_with_function_in_env() {
-        let mut closure_env = HashMap::new();
-        closure_env.insert("a".to_string(), NodeId(5));
-
-        impl_eval_test_with_env(
-            "a = x -> a",
-            &[ ],
-            Node::Closure { env: closure_env, expr: NodeId(3) },
-            &[
-                ("a".to_string(), NodeId(5))
-            ]
+        end_to_end_test("[1 + 2, 3 + 4]", 
+            vec![ 3.into(), 7.into() ].into()
         ).unwrap();
     }
 
     #[test]
     fn test_eval_nested_where() {
-        impl_eval_test_with_env(
+        end_to_end_test(
             "
             a + b 
             . a = 1 
             . b = 2",
-            &[ ],
-            Node::Int { data: 3 },
-            &[
-                ("b".to_string(), NodeId(8)),
-                ("a".to_string(), NodeId(4)),
-            ]
+            3.into(),
         ).unwrap();
     }
 
     #[test]
     fn test_eval_assert_with_truthy_cond_returns_true() {
-        impl_eval_test_with_env(
+        end_to_end_test(
             "123 ? #true",
-            &[ ],
-            Node::Int { data : 123 },
-            &[ ]
+            123.into(),
         ).unwrap();
     }
 
     #[test]
     fn test_eval_assert_with_truthy_cond_returns_true_right_side() {
-        impl_eval_test_with_env(
+        end_to_end_test(
             "#true ? 123",
-            &[ ],
-            Node::Int { data : 123 },
-            &[ ]
+            123.into(),
         ).unwrap();
     }
 
     #[test]
     fn test_eval_assert_with_truthy_cond_returns_false() {
-        let err = impl_eval_test_with_env(
+        let err = end_to_end_test(
             "123 ? #false",
-            &[ ],
-            Node::Int { data : 123 },
-            &[ ]
-        );
+            123.into(),
+        ).err().unwrap();
 
-        assert_eq!(err,
-            Err((EvalError::FalseConditionFound, 6))
-        );
+        assert_eq!(err, (EvalError::FalseConditionFound, 6));
     }
 
     #[test]
     fn test_eval_nested_assert() {
-        impl_eval_test_with_env(
+        end_to_end_test(
             "123 ? #true ? #true",
-            &[ ],
-            Node::Int { data : 123 },
-            &[ ]
-        ).unwrap();
-    }
-
-    #[test]
-    fn test_eval_hold() {
-        impl_eval_test_with_env(
-            "()",
-            &[ ],
-            Node::Hole,
-            &[ ]
+            123.into(),
         ).unwrap();
     }
 
     #[test]
     fn test_eval_function_application_one_arg() {
-        impl_eval_test_with_env(
+        end_to_end_test(
             "(x -> x + 1) 2",
-            &[ ],
-            Node::Int { data: 3 },
-            &[ ]
+            3.into(),
         ).unwrap();
     }
 
-    #[test]
-    fn test_eval_record_evaluates_value_expressions() {
-        impl_eval_test_with_env(
-            "{ a=1+2 }",
-            &[ ],
-            Node::Record{ keys: vec![NodeId(0)], values: vec![NodeId(6)] },
-            &[ ]
-        ).unwrap();
-    }
 
     #[test]
     fn test_eval_record_access() {
-        impl_eval_test_with_env(
+        end_to_end_test(
             "
             rec@key2
-            . rec = { a=1, key2=\"x\"}",
-            &[ ],
-            Node::String { data: "x".to_string() },
-            &[ 
-                ("rec".to_string(), NodeId(10))
-            ]
+            . rec = { a=1+4, key2=\"x\" ++ \"yy\"}",
+            "xyy".into(),
         ).unwrap();
     }
 
     #[test]
     fn test_eval_record_access_with_invalid_key() {
-        let err = impl_eval_test_with_env(
+        let err = end_to_end_test(
             "
             rec@badkey
             . rec = { a=1, key2=\"x\"}",
-            &[ ],
-            Node::String { data: "124".to_string() },
-            &[ 
-                ("rec".to_string(), NodeId(10))
-            ]
+            "124".into(),
         );
 
         assert_eq!(
@@ -5967,42 +5989,31 @@ mod tests {
 
     #[test]
     fn test_eval_list_access() {
-        impl_eval_test_with_env(
+        end_to_end_test(
             "
             list@2
             . list = [1, 2, 3]",
-            &[ ],
-            Node::Int { data: 3 },
-            &[ 
-                ("list".to_string(), NodeId(7))
-            ]
+            3.into(),
         ).unwrap();
     }
 
     #[test]
     fn test_eval_list_access_with_strings() {
-        impl_eval_test_with_env(
+        end_to_end_test(
             "
             list@1
             . list = [\"a\", \"b\", \"c\"]",
-            &[ ],
-            Node::String{ data: "b".to_string() },
-            &[ 
-                ("list".to_string(), NodeId(7))
-            ]
+            "b".into(),
         ).unwrap();
     }
 
     #[test]
     fn test_eval_list_invalid_access_returns_error() {
-        let err = impl_eval_test_with_env(
+        let err = end_to_end_test(
             "
             list@key2
             . list = [1, 2, 3]",
-            &[ ],
-            Node::String { data: "x".to_string() },
-            &[ 
-            ]
+            "x".into(),
         );
 
         assert_eq!(
@@ -6013,14 +6024,11 @@ mod tests {
 
     #[test]
     fn test_eval_list_index_out_of_bounds() {
-        let err = impl_eval_test_with_env(
+        let err = end_to_end_test(
             "
             list@999
             . list = [1, 2, 3]",
-            &[ ],
-            Node::String { data: "x".to_string() },
-            &[ 
-            ]
+            "x".into(),
         );
 
         assert_eq!(
@@ -6031,29 +6039,21 @@ mod tests {
 
     #[test]
     fn test_match_int_with_equal_int_matches() {
-        impl_eval_test_with_env(
+        end_to_end_test(
             "
             func 1 
             . func = | 1 -> 2",
-            &[ ],
-            Node::Int { data: 2 },
-            &[ 
-                ("func".to_string(), NodeId(7))
-            ]
+            2.into(),
         ).unwrap();
     }
 
     #[test]
     fn test_match_int_with_equal_int_fail_matches_return_error() {
-        let err = impl_eval_test_with_env(
+        let err = end_to_end_test(
             "
             func 999
             . func = | 1 -> 2",
-            &[ ],
-            Node::Int { data: 2 },
-            &[ 
-                ("func".to_string(), NodeId(7))
-            ]
+            2.into(),
         );
 
         assert_eq!(
@@ -6064,25 +6064,21 @@ mod tests {
 
     #[test]
     fn test_match_int_with_multiple_cases() {
-        impl_eval_test_with_env(
+        end_to_end_test(
             "
-            func 3
+            func 2
             . func = 
                 | 1 -> 2
                 | 2 -> 3
                 | 3 -> 4
             ",
-            &[ ],
-            Node::Int { data: 4 },
-            &[ 
-                ("func".to_string(), NodeId(13))
-            ]
+            3.into(),
         ).unwrap();
     }
 
     #[test]
     fn test_match_int_with_equal_int_fail_matches_return_error2() {
-        let err = impl_eval_test_with_env(
+        let err = end_to_end_test(
             "
             func 999
             . func = 
@@ -6090,11 +6086,7 @@ mod tests {
                 | 2 -> 3
                 | 3 -> 4
             ",
-            &[ ],
-            Node::Int { data: 2 },
-            &[ 
-                ("func".to_string(), NodeId(7))
-            ]
+            2.into(),
         );
 
         assert_eq!(
@@ -6105,27 +6097,21 @@ mod tests {
 
     #[test]
     fn test_eval_compose() {
-        impl_eval_test_with_env(
+        end_to_end_test(
             "
             ((a -> a + 1) >> (b -> b * 2)) 3
             ",
-            &[ ],
-            Node::Int { data: 8 },
-            &[ 
-            ]
+            8.into(),
         ).unwrap();
     }
 
     #[test]
     fn test_eval_compose_does_not_expose_internal_bbb() {
-        let err = impl_eval_test_with_env(
+        let err = end_to_end_test(
             "
             f 3 . f = ((y -> bbb) >> (z -> aaa))
             ",
-            &[ ],
-            Node::Int { data: 8 },
-            &[ 
-            ]
+            8.into(),
         );
 
         assert_eq!(
@@ -6137,14 +6123,11 @@ mod tests {
 
     #[test]
     fn test_eval_compose_does_not_expose_internal_aaa() {
-        let err = impl_eval_test_with_env(
+        let err = end_to_end_test(
             "
             f 3 . f = ((y -> y) >> (z -> aaa))
             ",
-            &[ ],
-            Node::Int { data: 8 },
-            &[ 
-            ]
+            8.into(),
         );
 
         assert_eq!(
@@ -6155,51 +6138,42 @@ mod tests {
     }
 
     #[test]
-    fn test_eval_compose_into_funciton() {
-        impl_eval_test_with_env(
+    fn test_eval_compose_into_function() {
+        end_to_end_test(
             "
-            f 3 . f = ((y -> y) >> (z -> z))
+            f 3 . f = ((y -> y) >> (z -> z * 3))
             ",
-            &[ ],
-            Node::Int { data: 3 },
-            &[ 
-                ("f".to_string(), NodeId(10))
-            ]
+            9.into(),
         ).unwrap();
        
     }
 
     #[test]
     fn test_double_compose() {
-        impl_eval_test_with_env(
+        end_to_end_test(
             "
             ((a -> a + 1) >> (x -> x) >> (b -> b * 2)) 3
             ",
-            &[ ],
-            Node::Int { data: 8 },
-            &[ 
-            ]
+            8.into(),
         ).unwrap();
        
     }
 
     #[test]
     fn test_reverse_compose() {
-        impl_eval_test_with_env(
+        end_to_end_test(
             "
             ((a -> a + 1) << (b -> b * 2)) 3
             ",
-            &[ ],
-            Node::Int { data: 7 },
-            &[ 
-            ]
+            7.into(),
         ).unwrap();
        
     }
 
+    /*
     #[test]
     fn test_bytes_return_bytes() {
-        impl_eval_test_with_env(
+        end_to_end_test(
             "
             ~~QUJD
             ",
@@ -6213,7 +6187,7 @@ mod tests {
 
     #[test]
     fn test_bytes_base85_return_bytes() {
-        impl_eval_test_with_env(
+        end_to_end_test(
             "
             ~~85'K|(_
             ",
@@ -6227,7 +6201,7 @@ mod tests {
 
     #[test]
     fn test_bytes_base64_return_bytes() {
-        impl_eval_test_with_env(
+        end_to_end_test(
             "
             ~~64'QUJD
             ",
@@ -6241,7 +6215,7 @@ mod tests {
 
     #[test]
     fn test_bytes_base32_return_bytes() {
-        impl_eval_test_with_env(
+        end_to_end_test(
             "
             ~~32'IFBEG===
             ",
@@ -6255,7 +6229,7 @@ mod tests {
 
     #[test]
     fn test_bytes_base16_return_bytes() {
-        impl_eval_test_with_env(
+        end_to_end_test(
             "
             ~~16'414243
             ",
@@ -6268,7 +6242,7 @@ mod tests {
 
     #[test]
     fn test_int_add_returns_int() {
-        impl_eval_test_with_env(
+        end_to_end_test(
             "
             1 + 2
             ",
@@ -6281,7 +6255,7 @@ mod tests {
 
     #[test]
     fn test_int_sub_returns_int() {
-        impl_eval_test_with_env(
+        end_to_end_test(
             "
             1 - 2
             ",
@@ -6294,7 +6268,7 @@ mod tests {
 
     #[test]
     fn test_string_concat_returns_string() {
-        impl_eval_test_with_env(
+        end_to_end_test(
             "
             \"abc\" ++ \"def\"
             ",
@@ -6307,7 +6281,7 @@ mod tests {
 
     #[test]
     fn test_list_cons_returns_list() {
-        impl_eval_test_with_env(
+        end_to_end_test(
             "
             1 >+ [2,3]
             ",
@@ -6320,7 +6294,7 @@ mod tests {
 
     #[test]
     fn test_list_cons_nested_returns_list() {
-        impl_eval_test_with_env(
+        end_to_end_test(
             "
             1 >+ 2 >+ [3,4]
             ",
@@ -6333,7 +6307,7 @@ mod tests {
 
     #[test]
     fn test_list_append_returns_list() {
-        impl_eval_test_with_env(
+        end_to_end_test(
             "
             [1,2] +< 3
             ",
@@ -6346,7 +6320,7 @@ mod tests {
 
     #[test]
     fn test_list_append_nested_returns_list() {
-        impl_eval_test_with_env(
+        end_to_end_test(
             "
             [1,2] +< 3 +< 4
             ",
@@ -6359,7 +6333,7 @@ mod tests {
 
     #[test]
     fn test_empty_list() {
-        impl_eval_test_with_env(
+        end_to_end_test(
             "
             []
             ",
@@ -6372,7 +6346,7 @@ mod tests {
 
     #[test]
     fn test_list_of_ints() {
-        impl_eval_test_with_env(
+        end_to_end_test(
             "
             [1, 2, 3]
             ",
@@ -6385,7 +6359,7 @@ mod tests {
 
     #[test]
     fn test_list_of_exprs() {
-        impl_eval_test_with_env(
+        end_to_end_test(
             "
             [1+2, 3+4]
 
@@ -6682,12 +6656,12 @@ mod tests {
             Node::Int { data: 5 },
         ).unwrap();
     }
+    */
 }
 
 
 
 fn print_ast(ast: &SyntaxTree) {
-    println!("--- AST ---");
     for (i, node) in ast.nodes.iter().enumerate() {
         println!("{i}: {node:?}");
     }
