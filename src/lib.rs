@@ -1052,6 +1052,7 @@ impl SyntaxTree {
     }
 
     #[must_use]
+    #[allow(clippy::missing_panics_doc)]
     pub fn finish(&self, node: NodeId) -> Option<EvalResult> {
         // match self.nodes[node] {
         Some(match self.nodes.get(node.0)?.clone() {
@@ -1060,7 +1061,7 @@ impl SyntaxTree {
             Node::Assign { left, right } => {
                 dbg!(&self.nodes[left]);
                 dbg!(&self.nodes[right]);
-                unreachable!();
+                return None;
             }
             Node::String { data } => EvalResult::String(data),
             Node::True => EvalResult::True,
@@ -1083,11 +1084,14 @@ impl SyntaxTree {
             Node::StrConcat{ left, right } => {
                 match (self.finish(left)?, self.finish(right)?) {
                     (EvalResult::String(mut left), EvalResult::String(right)) => {
-                        left.extend(right.chars());
+                        left.push_str(&right);
                         EvalResult::String(left)
                     }
                     _ => return None
                 }
+            }
+            Node::Bytes { data } => {
+                EvalResult::Bytes(data)
             }
             x => todo!("{x:?}"),
         })
@@ -1103,6 +1107,7 @@ pub enum EvalResult {
     Float([u8; 8]),
     String(String),
     List(Vec<EvalResult>),
+    Bytes(Vec<u8>),
     Record { keys: Vec<EvalResult>, values: Vec<EvalResult> },
 }
 
@@ -1245,7 +1250,7 @@ pub fn eval(
         let curr_node = &ast.nodes[curr_node_id];
 
         eprintln!("--- TOP ---");
-        print_ast(&ast);
+        print_ast(ast);
         eprintln!("Node ({curr_node_id}) {curr_node:?}");
         eprintln!("Contexts: {contexts:?}");
         eprintln!("State: {eval_state:?}");
@@ -1293,7 +1298,7 @@ pub fn eval(
 
         eprintln!("Work {work:?}");
         eprintln!("Env {:?}", ctx.env);
-        eprintln!("Arguments {:?}", arguments);
+        eprintln!("Arguments {arguments:?}");
         eprintln!("Contexts {contexts:?}");
        
         match curr_node {
@@ -1830,7 +1835,7 @@ pub fn eval(
                     }
                     Node::List { data } => {
                         let Node::Int { data: index} = right_data else {
-                            return Err((EvalError::InvalidListAccessType(ast.get_type(&right)), ast.positions[right.0]));
+                            return Err((EvalError::InvalidListAccessType(ast.get_type(right)), ast.positions[right.0]));
                         };
 
                         if usize::try_from(*index).unwrap() >= data.len() {
@@ -1874,7 +1879,7 @@ pub fn eval(
                     let curr_check_case = &ast.nodes[left.0];
 
                     match curr_check_case {
-                        Node::Record { keys: checked_keys, values: checked_values } if wanted_case_type == Type::Record => {
+                        Node::Record { keys: checked_keys, ..  } if wanted_case_type == Type::Record => {
                             let Node::Record { keys: wanted_keys, values: wanted_values } = wanted_case else {
                                 unreachable!();
                             };
@@ -1894,7 +1899,7 @@ pub fn eval(
                                         };
 
                                         let new_value = wanted_values[index];
-                                        results.insert((data.to_string(), wanted_values[index]));
+                                        results.insert((data.to_string(), new_value));
                                         continue 'next_key;
                                     }
                                 }
@@ -1984,17 +1989,27 @@ pub fn eval(
         }
     }
 
-
-    ctx.args.clear();
-    ctx.env.clear();
-
+    // Error case for debugging
     if arguments.is_empty() {
-        print_ast(&ast);
+        print_ast(ast);
         dbg!(&arguments);
         assert!(arguments.len() == 1);
     }
 
-    let result = arguments.pop_back().unwrap();
+    let mut result = arguments.pop_back().unwrap();
+
+    // If the result is a variable, attempt to use the variable's value
+    if let Some(Node::Var { data }) = ast.nodes.get(result.0) {
+        if let Some(res) = ctx.env.get(data) {
+            result = *res;
+            
+        }
+    }
+
+    // Clear the context
+    ctx.args.clear();
+    ctx.env.clear();
+
     Ok(ast.finish(result).unwrap())
 }
 
@@ -3233,6 +3248,12 @@ pub fn token_length(input: &str) -> Result<usize, (TokenError, usize)> {
     }
 
     Ok(index - 1)
+}
+
+fn print_ast(ast: &SyntaxTree) {
+    for (i, node) in ast.nodes.iter().enumerate() {
+        println!("{i}: {node:?}");
+    }
 }
 
 #[cfg(test)]
@@ -6170,17 +6191,13 @@ mod tests {
        
     }
 
-    /*
     #[test]
     fn test_bytes_return_bytes() {
         end_to_end_test(
             "
             ~~QUJD
             ",
-            &[ ],
-            Node::Bytes { data: vec![b'A', b'B', b'C'] },
-            &[ 
-            ]
+            EvalResult::Bytes(vec![b'A', b'B', b'C']),
         ).unwrap();
        
     }
@@ -6191,10 +6208,7 @@ mod tests {
             "
             ~~85'K|(_
             ",
-            &[ ],
-            Node::Bytes { data: vec![b'A', b'B', b'C'] },
-            &[ 
-            ]
+            EvalResult::Bytes(vec![b'A', b'B', b'C'])
         ).unwrap();
        
     }
@@ -6205,10 +6219,7 @@ mod tests {
             "
             ~~64'QUJD
             ",
-            &[ ],
-            Node::Bytes { data: vec![b'A', b'B', b'C'] },
-            &[ 
-            ]
+            EvalResult::Bytes(vec![b'A', b'B', b'C'])
         ).unwrap();
        
     }
@@ -6219,10 +6230,7 @@ mod tests {
             "
             ~~32'IFBEG===
             ",
-            &[ ],
-            Node::Bytes { data: vec![b'A', b'B', b'C'] },
-            &[ 
-            ]
+            EvalResult::Bytes(vec![b'A', b'B', b'C'])
         ).unwrap();
        
     }
@@ -6233,10 +6241,7 @@ mod tests {
             "
             ~~16'414243
             ",
-            &[ ],
-            Node::Bytes { data: vec![b'A', b'B', b'C'] },
-            &[ 
-            ]
+            EvalResult::Bytes(vec![b'A', b'B', b'C'])
         ).unwrap();
     }
 
@@ -6246,10 +6251,7 @@ mod tests {
             "
             1 + 2
             ",
-            &[ ],
-            Node::Int{ data: 3 },
-            &[ 
-            ]
+            3.into()
         ).unwrap();
     }
 
@@ -6259,10 +6261,7 @@ mod tests {
             "
             1 - 2
             ",
-            &[ ],
-            Node::Int{ data: -1 },
-            &[ 
-            ]
+            (-1).into()
         ).unwrap();
     }
 
@@ -6272,23 +6271,7 @@ mod tests {
             "
             \"abc\" ++ \"def\"
             ",
-            &[ ],
-            Node::String { data: "abcdef".to_string() },
-            &[ 
-            ]
-        ).unwrap();
-    }
-
-    #[test]
-    fn test_list_cons_returns_list() {
-        end_to_end_test(
-            "
-            1 >+ [2,3]
-            ",
-            &[ ],
-            Node::List{ data: vec![NodeId(0), NodeId(1), NodeId(2)]},
-            &[ 
-            ]
+            "abcdef".into()
         ).unwrap();
     }
 
@@ -6298,10 +6281,7 @@ mod tests {
             "
             1 >+ 2 >+ [3,4]
             ",
-            &[ ],
-            Node::List{ data: vec![NodeId(0), NodeId(1), NodeId(2), NodeId(3)]},
-            &[ 
-            ]
+            vec![1.into(), 2.into(), 3.into(), 4.into()].into()
         ).unwrap();
     }
 
@@ -6311,10 +6291,7 @@ mod tests {
             "
             [1,2] +< 3
             ",
-            &[ ],
-            Node::List{ data: vec![NodeId(0), NodeId(1), NodeId(3)]},
-            &[ 
-            ]
+            vec![1.into(), 2.into(), 3.into()].into()
         ).unwrap();
     }
 
@@ -6324,50 +6301,7 @@ mod tests {
             "
             [1,2] +< 3 +< 4
             ",
-            &[ ],
-            Node::List{ data: vec![NodeId(0), NodeId(1), NodeId(3), NodeId(5)]},
-            &[ 
-            ]
-        ).unwrap();
-    }
-
-    #[test]
-    fn test_empty_list() {
-        end_to_end_test(
-            "
-            []
-            ",
-            &[ ],
-            Node::List{ data: vec![]},
-            &[ 
-            ]
-        ).unwrap();
-    }
-
-    #[test]
-    fn test_list_of_ints() {
-        end_to_end_test(
-            "
-            [1, 2, 3]
-            ",
-            &[ ],
-            Node::List{ data: vec![NodeId(0), NodeId(1), NodeId(2)]},
-            &[ 
-            ]
-        ).unwrap();
-    }
-
-    #[test]
-    fn test_list_of_exprs() {
-        end_to_end_test(
-            "
-            [1+2, 3+4]
-
-            ",
-            &[ ],
-            Node::List { data: vec![ NodeId(7), NodeId(8), ]},
-            &[ 
-            ]
+            vec![1.into(), 2.into(), 3.into(), 4.into()].into()
         ).unwrap();
     }
 
@@ -6378,7 +6312,7 @@ mod tests {
             a + 2
             . a = 1
             ",
-            Node::Int { data: 3 },
+            3.into()
         ).unwrap();
     }
 
@@ -6390,7 +6324,7 @@ mod tests {
             . a = 1
             . b = 4
             ",
-            Node::Int { data: 5 },
+            5.into()
         ).unwrap();
     }
 
@@ -6401,7 +6335,7 @@ mod tests {
             a + 1 ? a == 1
             . a = 1
             ",
-            Node::Int { data: 2 },
+            2.into()
         ).unwrap();
     }
 
@@ -6412,7 +6346,7 @@ mod tests {
             a + 1 ? a == 2
             . a = 1
             ",
-            Node::Int { data: 2 },
+            2.into()
         );
 
         assert_eq!(err, Err((EvalError::FalseConditionFound, 23)));
@@ -6426,15 +6360,7 @@ mod tests {
             . a = 1
             . b = 2
             ",
-            Node::Int { data: 3 },
-        ).unwrap();
-    }
-
-    #[test]
-    fn test_hole() {
-        end_to_end_test(
-            "()",
-            Node::Hole,
+            3.into()
         ).unwrap();
     }
 
@@ -6446,7 +6372,7 @@ mod tests {
             . a = 1
             . b = a
             ",
-            Node::Int { data: 1 },
+            1.into()
         ).unwrap();
     }
 
@@ -6456,7 +6382,7 @@ mod tests {
             "
             (a -> b -> a + b) 8 1
             ",
-            Node::Int { data: 9 },
+            9.into()
         ).unwrap();
     }
 
@@ -6466,17 +6392,7 @@ mod tests {
             "
             (a -> b -> [a, b]) 3 2
             ",
-            Node::List { data: vec![NodeId(7), NodeId(9)] },
-        ).unwrap();
-    }
-
-    #[test]
-    fn test_create_record() {
-        end_to_end_test(
-            "
-            { a = 1 + 4 }
-            ",
-            Node::Record { keys: vec![NodeId(0)], values: vec![NodeId(6)] },
+            vec![3.into(), 2.into()].into()
         ).unwrap();
     }
 
@@ -6488,7 +6404,7 @@ mod tests {
             . badvalue =  { a = 1, b = \"nope\" }
             . rec =  { a = 1 + 4, b = \"x\" }
             ",
-            Node::String { data: "x".to_string() },
+            "x".into()
         ).unwrap();
     }
 
@@ -6499,7 +6415,7 @@ mod tests {
             xs@1
             . xs =  [0, 1, 2, 3, 4]
             ",
-            Node::Int { data: 1 },
+            1.into()
         ).unwrap();
     }
 
@@ -6510,7 +6426,7 @@ mod tests {
             xs@(1+1)
             . xs =  [0, 1, 2, 3, 4]
             ",
-            Node::Int { data: 2 },
+            2.into()
         ).unwrap();
     }
 
@@ -6522,7 +6438,7 @@ mod tests {
             . xs = [0, 1, 2, 3, 4]
             . y  = 4
             ",
-            Node::Int { data: 4 },
+            4.into()
         ).unwrap();
     }
 
@@ -6533,25 +6449,15 @@ mod tests {
             (x -> x) c
             . c = 123
             ",
-            Node::Int { data: 123 },
+            123.into()
         ).unwrap();
-    }
-
-    #[test]
-    fn test_non_var_function_arg_raises_parse_error() {
-        let err = end_to_end_test(
-            "1 -> a",
-            Node::Int { data: 123 },
-        );
-
-        assert_eq!(err, Err((EvalError::InvalidFunctionName, 0)));
     }
 
     #[test]
     fn test_compose() {
         end_to_end_test(
             "((a -> a + 1) >> (b -> b * 2)) 3",
-            Node::Int { data: 8 },
+            8.into()
         ).unwrap();
     }
 
@@ -6562,7 +6468,7 @@ mod tests {
             f 3
             . f = ((y -> x) >> (z -> x))
             ",
-            Node::Int { data: 8 },
+            8.into()
         );
 
         assert_eq!(err, Err((EvalError::VariableNotFoundInScope("x".to_string()), 42)));
@@ -6572,7 +6478,7 @@ mod tests {
     fn test_double_compose_end_to_end() {
         end_to_end_test(
             "((a -> a + 1) >> (x -> x) >> (b -> b * 2)) 3",
-            Node::Int { data: 8 },
+            8.into()
         ).unwrap();
     }
 
@@ -6580,7 +6486,7 @@ mod tests {
     fn test_reverse_compose_end_to_end() {
         end_to_end_test(
             "((a -> a + 1) << (b -> b * 2)) 3",
-            Node::Int { data: 7 },
+            7.into()
         ).unwrap();
     }
 
@@ -6593,7 +6499,7 @@ mod tests {
               | 1 -> 2
               | 2 -> 3
             ",
-            Node::Int { data: 3 },
+            3.into()
         ).unwrap();
     }
 
@@ -6605,7 +6511,7 @@ mod tests {
             . id =
               | x -> x
             ",
-            Node::Int { data: 3 },
+            3.into()
         ).unwrap();
     }
 
@@ -6617,7 +6523,7 @@ mod tests {
             . id =
               | x -> x * 4 + 1
             ",
-            Node::Int { data: 13 },
+            13.into()
         ).unwrap();
     }
 
@@ -6630,7 +6536,7 @@ mod tests {
               | x -> x
               | y -> y * 2
             ",
-            Node::Int { data: 3 },
+            3.into()
         ).unwrap();
     }
 
@@ -6642,7 +6548,7 @@ mod tests {
             . f = a -> 
               | b -> a + b
             ",
-            Node::Int { data: 12 },
+            12.into()
         ).unwrap();
     }
 
@@ -6653,16 +6559,9 @@ mod tests {
             . rec = { x = 5 } 
             . get_x =  
               | { x = x } -> x",
-            Node::Int { data: 5 },
+            5.into()
         ).unwrap();
     }
-    */
 }
 
 
-
-fn print_ast(ast: &SyntaxTree) {
-    for (i, node) in ast.nodes.iter().enumerate() {
-        println!("{i}: {node:?}");
-    }
-}
